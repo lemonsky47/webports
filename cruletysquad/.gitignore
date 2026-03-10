@@ -1,0 +1,7 @@
+# Ignore original large files - these should be split into chunks
+index.pck
+index.pck.gz
+
+# Keep the chunks and manifest for GitHub
+!index.pck.gz.part*
+!chunks_manifest.json

@@ -259,16 +259,37 @@
 					offset += chunk.byteLength;
 				}
 
-				progressCallback('Decompressing...');
+				progressCallback('Decompressing (this may take a moment)...');
 
-				// Decompress using DecompressionStream
-				const blob = new Blob([combined]);
-				const stream = blob.stream();
-				const decompressedStream = stream.pipeThrough(new DecompressionStream('gzip'));
-				const decompressedBlob = await new Response(decompressedStream).blob();
-				const decompressed = await decompressedBlob.arrayBuffer();
+				// Safely decompress bypassing the 500MB browser Blob limit
+				const stream = new Blob([combined]).stream().pipeThrough(new DecompressionStream('gzip'));
+				const reader = stream.getReader();
 
-				return decompressed;
+				const uncompressedChunks =[];
+				let uncompressedSize = 0;
+
+				while (true) {
+					const { done, value } = await reader.read();
+					if (done) break;
+					uncompressedChunks.push(value); // value is a Uint8Array
+					uncompressedSize += value.byteLength;
+				}
+
+				// Integrity check
+				const expectedSize = GODOT_CONFIG.fileSizes["index.pck"];
+				if (uncompressedSize !== expectedSize) {
+					console.error(`Decompression truncated! Expected ${expectedSize} bytes but got ${uncompressedSize}`);
+				}
+
+				// Combine into final array buffer
+				const decompressed = new Uint8Array(uncompressedSize);
+				let outOffset = 0;
+				for (const c of uncompressedChunks) {
+					decompressed.set(c, outOffset);
+					outOffset += c.byteLength;
+				}
+
+				return decompressed.buffer;
 			},
 
 			async checkAndUnpack(progressCallback) {
@@ -412,7 +433,7 @@
 								return Promise.resolve(new Response(unpackedPckData, {
 									status: 200,
 									statusText: 'OK',
-									headers: { 'Content-Type': 'application/octet-stream' }
+									headers: { 'Content-Type': 'application/octet-stream', 'Content-Length': unpackedPckData.byteLength.toString() }
 								}));
 							}
 							return originalFetch.apply(this, arguments);
