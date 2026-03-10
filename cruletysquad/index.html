@@ -3,6 +3,7 @@
 
 <head>
 	<meta charset='utf-8' />
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/pako/2.1.0/pako.min.js"></script>
 	<meta name='viewport' content='width=device-width, user-scalable=no' />
 	<title>Cruelty Squad</title>
 	<style type='text/css'>
@@ -220,7 +221,7 @@
 				if (!chunkNames || chunkNames.length === 0) {
 					let partNum = 0;
 					while (true) {
-						const partName = `index.pck.gz.part${String(partNum).padStart(3, '0')}`;
+						const partName = `index.pck.part${String(partNum).padStart(3, '0')}`;
 						try {
 							progressCallback(`Downloading ${partName}...`);
 							const response = await fetch(partName);
@@ -248,49 +249,40 @@
 			},
 
 			async reassembleAndDecompress(chunks, progressCallback) {
-				progressCallback('Reassembling chunks...');
+              progressCallback('Reassembling chunks...');
 
-				// Combine all chunks
-				const totalSize = chunks.reduce((sum, chunk) => sum + chunk.byteLength, 0);
-				const combined = new Uint8Array(totalSize);
-				let offset = 0;
-				for (const chunk of chunks) {
-					combined.set(new Uint8Array(chunk), offset);
-					offset += chunk.byteLength;
-				}
+              // 1. Calculate total size of the COMPRESSED parts
+              const totalCompressedSize = chunks.reduce((sum, chunk) => sum + chunk.byteLength, 0);
+              const combinedCompressed = new Uint8Array(totalCompressedSize);
 
-				progressCallback('Decompressing (this may take a moment)...');
+              // 2. Concatenate them into one giant Uint8Array
+              let offset = 0;
+              for (const chunk of chunks) {
+                  combinedCompressed.set(new Uint8Array(chunk), offset);
+                  offset += chunk.byteLength;
+              }
 
-				// Safely decompress bypassing the 500MB browser Blob limit
-				const stream = new Blob([combined]).stream().pipeThrough(new DecompressionStream('gzip'));
-				const reader = stream.getReader();
+              progressCallback('Decompressing with Pako...');
 
-				const uncompressedChunks =[];
-				let uncompressedSize = 0;
+              try {
+                  // 3. Pako handles multi-member gzip files perfectly
+                  // This replaces the entire DecompressionStream logic
+                  const decompressed = pako.inflate(combinedCompressed);
 
-				while (true) {
-					const { done, value } = await reader.read();
-					if (done) break;
-					uncompressedChunks.push(value); // value is a Uint8Array
-					uncompressedSize += value.byteLength;
-				}
+                  console.log("Decompression successful! Size:", decompressed.byteLength);
 
-				// Integrity check
-				const expectedSize = GODOT_CONFIG.fileSizes["index.pck"];
-				if (uncompressedSize !== expectedSize) {
-					console.error(`Decompression truncated! Expected ${expectedSize} bytes but got ${uncompressedSize}`);
-				}
+                  // 4. Integrity check
+                  const expectedSize = GODOT_CONFIG.fileSizes["index.pck"];
+                  if (decompressed.byteLength !== expectedSize) {
+                      console.error(`SIZE MISMATCH: Expected ${expectedSize} but got ${decompressed.byteLength}`);
+                  }
 
-				// Combine into final array buffer
-				const decompressed = new Uint8Array(uncompressedSize);
-				let outOffset = 0;
-				for (const c of uncompressedChunks) {
-					decompressed.set(c, outOffset);
-					outOffset += c.byteLength;
-				}
-
-				return decompressed.buffer;
-			},
+                  return decompressed.buffer;
+              } catch (err) {
+                  console.error("Pako decompression failed:", err);
+                  throw new Error("Decompression failed: " + err.message);
+              }
+          },
 
 			async checkAndUnpack(progressCallback) {
 				// Check if index.pck is accessible via fetch
@@ -420,7 +412,7 @@
 					setStatusMode('notice');
 				}).then((data) => {
 					unpackedPckData = data;
-					
+
 					// If we have unpacked data, override fetch to intercept requests for index.pck
 					if (unpackedPckData) {
 						const originalFetch = window.fetch;
@@ -439,7 +431,7 @@
 							return originalFetch.apply(this, arguments);
 						};
 					}
-					
+
 					// Start the engine with progress tracking
 					const engineOptions = {
 						'onProgress': function (current, total) {
@@ -457,7 +449,7 @@
 							}
 						}
 					};
-					
+
 					return engine.startGame(engineOptions);
 				}).then(() => {
 					setStatusMode('hidden');

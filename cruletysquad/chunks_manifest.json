@@ -1,20 +1,20 @@
 {
   "originalFile": "index.pck",
   "originalSize": 534748816,
-  "compressedSize": 255921650,
+  "compressedSize": 255921652,
   "chunks": [
-    {"name": "index.pck.gz.part000", "size": 19922944},
-    {"name": "index.pck.gz.part001", "size": 19922944},
-    {"name": "index.pck.gz.part002", "size": 19922944},
-    {"name": "index.pck.gz.part003", "size": 19922944},
-    {"name": "index.pck.gz.part004", "size": 19922944},
-    {"name": "index.pck.gz.part005", "size": 19922944},
-    {"name": "index.pck.gz.part006", "size": 19922944},
-    {"name": "index.pck.gz.part007", "size": 19922944},
-    {"name": "index.pck.gz.part008", "size": 19922944},
-    {"name": "index.pck.gz.part009", "size": 19922944},
-    {"name": "index.pck.gz.part010", "size": 19922944},
-    {"name": "index.pck.gz.part011", "size": 19922944},
-    {"name": "index.pck.gz.part012", "size": 16846322}
+    {"name": "index.pck.part000", "size": 19922944},
+    {"name": "index.pck.part001", "size": 19922944},
+    {"name": "index.pck.part002", "size": 19922944},
+    {"name": "index.pck.part003", "size": 19922944},
+    {"name": "index.pck.part004", "size": 19922944},
+    {"name": "index.pck.part005", "size": 19922944},
+    {"name": "index.pck.part006", "size": 19922944},
+    {"name": "index.pck.part007", "size": 19922944},
+    {"name": "index.pck.part008", "size": 19922944},
+    {"name": "index.pck.part009", "size": 19922944},
+    {"name": "index.pck.part010", "size": 19922944},
+    {"name": "index.pck.part011", "size": 19922944},
+    {"name": "index.pck.part012", "size": 16846324}
   ]
 }
