@@ -1,0 +1,336 @@
+<!DOCTYPE html>
+<html lang="en">
+	<head>
+		<meta charset="utf-8">
+		<meta name="viewport" content="width=device-width, user-scalable=no, initial-scale=1.0">
+		<title>Replicube</title>
+
+		<script src="https://cdnjs.cloudflare.com/ajax/libs/pako/2.1.0/pako.min.js"></script>
+
+		<style>
+html, body, #canvas {
+	margin: 0;
+	padding: 0;
+	border: 0;
+}
+
+body {
+	color: white;
+	background-color: black;
+	overflow: hidden;
+	touch-action: none;
+}
+
+#canvas {
+	display: block;
+}
+
+#canvas:focus {
+	outline: none;
+}
+
+#status, #status-splash, #status-progress {
+	position: absolute;
+	left: 0;
+	right: 0;
+}
+
+#status, #status-splash {
+	top: 0;
+	bottom: 0;
+}
+
+#status {
+	background-color: #000000;
+	display: flex;
+	flex-direction: column;
+	justify-content: center;
+	align-items: center;
+	visibility: hidden;
+}
+
+#status-splash {
+	max-height: 100%;
+	max-width: 100%;
+	margin: auto;
+}
+
+#status-splash.show-image--false {
+	display: none;
+}
+
+#status-splash.fullsize--true {
+	height: 100%;
+	width: 100%;
+	object-fit: contain;
+}
+
+#status-splash.use-filter--false {
+	image-rendering: pixelated;
+}
+
+#status-progress, #status-notice {
+	display: none;
+}
+
+#status-progress {
+	bottom: 10%;
+	width: 50%;
+	margin: 0 auto;
+}
+
+#status-notice {
+	background-color: #5b3943;
+	border-radius: 0.5rem;
+	border: 1px solid #9b3943;
+	color: #e0e0e0;
+	font-family: 'Noto Sans', 'Droid Sans', Arial, sans-serif;
+	line-height: 1.3;
+	margin: 0 2rem;
+	overflow: hidden;
+	padding: 1rem;
+	text-align: center;
+	z-index: 1;
+}
+		</style>
+		<link id="-gd-engine-icon" rel="icon" type="image/png" href="index.icon.png" />
+<link rel="apple-touch-icon" href="index.apple-touch-icon.png"/>
+
+	</head>
+	<body>
+		<canvas id="canvas">
+			Your browser does not support the canvas tag.
+		</canvas>
+
+		<noscript>
+			Your browser does not support JavaScript.
+		</noscript>
+
+		<div id="status">
+			<img id="status-splash" class="show-image--true fullsize--true use-filter--false" src="index.png" alt="">
+			<progress id="status-progress"></progress>
+			<div id="status-notice"></div>
+		</div>
+
+		<script src="index.js"></script>
+		<script>
+const GODOT_CONFIG = {"args":[],"canvasResizePolicy":2,"ensureCrossOriginIsolationHeaders":true,"executable":"index","experimentalVK":false,"fileSizes":{"index.pck":75069024,"index.wasm":40976929},"focusCanvas":true,"gdextensionLibs":[]};
+const GODOT_THREADS_ENABLED = false;
+
+const ChunkUnpacker = {
+			DB_NAME: 'GodotGameDB_Replicube',
+			STORE_NAME: 'files',
+
+			async initDB() {
+				return new Promise((resolve, reject) => {
+					const request = indexedDB.open(this.DB_NAME, 1);
+					request.onerror = () => reject(request.error);
+					request.onsuccess = () => resolve(request.result);
+					request.onupgradeneeded = (event) => {
+						const db = event.target.result;
+						if (!db.objectStoreNames.contains(this.STORE_NAME)) {
+							db.createObjectStore(this.STORE_NAME);
+						}
+					};
+				});
+			},
+
+			async getStoredFile(db, filename) {
+				return new Promise((resolve, reject) => {
+					const transaction = db.transaction([this.STORE_NAME], 'readonly');
+					const store = transaction.objectStore(this.STORE_NAME);
+					const request = store.get(filename);
+					request.onerror = () => reject(request.error);
+					request.onsuccess = () => resolve(request.result);
+				});
+			},
+
+			async storeFile(db, filename, data) {
+				return new Promise((resolve, reject) => {
+					const transaction = db.transaction([this.STORE_NAME], 'readwrite');
+					const store = transaction.objectStore(this.STORE_NAME);
+					const request = store.put(data, filename);
+					request.onerror = () => reject(request.error);
+					request.onsuccess = () => resolve();
+				});
+			},
+
+			async fetchChunks(filename, progressCallback) {
+				const chunks =[];
+				let partNum = 0;
+
+				// Optional: Check manifest first if you want to avoid the 404 in the console
+				try {
+					const manifestRes = await fetch('chunks_manifest.json');
+					if (manifestRes.ok) {
+						const manifest = await manifestRes.json();
+						const chunkNames = (manifest.chunks ||[]).map(c => c.name).filter(n => n.startsWith(filename));
+						if (chunkNames.length > 0) {
+							for (let i = 0; i < chunkNames.length; i++) {
+								progressCallback(`Downloading ${chunkNames[i]}... (${i + 1}/${chunkNames.length})`);
+								const response = await fetch(chunkNames[i]);
+								if (!response.ok) throw new Error(`Failed to load ${chunkNames[i]}`);
+								chunks.push(await response.arrayBuffer());
+							}
+							return chunks;
+						}
+					}
+				} catch (e) { /* Fallback to probing */ }
+
+				// Probing method (will cause one 404 in console when it reaches the end)
+				while (true) {
+					const partName = `${filename}.part${String(partNum).padStart(3, '0')}`;
+					try {
+						progressCallback(`Downloading ${partName}...`);
+						const response = await fetch(partName);
+						if (!response.ok) {
+							if (partNum === 0) throw new Error(`No chunks found for ${filename}`);
+							break; // Reached the end
+						}
+						chunks.push(await response.arrayBuffer());
+						partNum++;
+					} catch (e) {
+						if (partNum === 0) throw e;
+						break;
+					}
+				}
+				return chunks;
+			},
+
+			async reassembleAndDecompress(chunks, filename, progressCallback) {
+				progressCallback(`Reassembling ${filename}...`);
+				const totalCompressedSize = chunks.reduce((sum, chunk) => sum + chunk.byteLength, 0);
+				const combined = new Uint8Array(totalCompressedSize);
+
+				let offset = 0;
+				for (const chunk of chunks) {
+					combined.set(new Uint8Array(chunk), offset);
+					offset += chunk.byteLength;
+				}
+
+				progressCallback(`Processing ${filename}...`);
+
+				try {
+					// Attempt to decompress with Pako (works if you zipped the split chunks)
+					const decompressed = pako.inflate(combined);
+					console.log(`Decompressed ${filename} successfully. Size:`, decompressed.byteLength);
+
+					if (GODOT_CONFIG.fileSizes[filename] && decompressed.byteLength !== GODOT_CONFIG.fileSizes[filename]) {
+						console.warn(`Size mismatch for ${filename}. Expected ${GODOT_CONFIG.fileSizes[filename]}, got ${decompressed.byteLength}`);
+					}
+
+					return decompressed.buffer;
+				} catch (err) {
+					// If it throws an error, it means the chunks were NOT compressed!
+					// This safely falls back to just returning the stitched raw chunks (useful for uncompressed WASM parts)
+					console.log(`${filename} is not compressed (or Pako failed). Using raw stitched chunks.`);
+					return combined.buffer;
+				}
+			},
+
+			async checkAndUnpack(filename, progressCallback) {
+				// Check server directly (skip unpacking if full file is uploaded)
+				try {
+					const response = await fetch(filename, { method: 'HEAD' });
+					if (response.ok) {
+						progressCallback(`${filename} found on server, no unpacking needed.`);
+						return null;
+					}
+				} catch (e) {}
+
+				const db = await this.initDB();
+				const stored = await this.getStoredFile(db, filename);
+				if (stored) {
+					progressCallback(`Using cached ${filename} from database.`);
+					return stored;
+				}
+
+				const chunks = await this.fetchChunks(filename, progressCallback);
+				const reassembled = await this.reassembleAndDecompress(chunks, filename, progressCallback);
+
+				progressCallback(`Caching ${filename}...`);
+				await this.storeFile(db, filename, reassembled);
+
+				return reassembled;
+			}
+		};
+
+		// --- INTERCEPTOR LOGIC ---
+		const originalFetch = window.fetch;
+		const unpackedFiles = new Map();
+
+		window.fetch = async function(resource, init) {
+			const url = typeof resource === 'string' ? resource : (resource && resource.url);
+			const filename = url ? url.split('/').pop().split('?')[0] : '';
+
+			if (unpackedFiles.has(filename)) {
+				console.log(`Intercepting request for ${filename}, serving from memory.`);
+				const data = unpackedFiles.get(filename);
+				const mimeType = filename.endsWith('.wasm') ? 'application/wasm' : 'application/octet-stream';
+
+				return new Response(data, {
+					status: 200,
+					headers: {
+						'Content-Type': mimeType,
+						'Content-Length': data.byteLength.toString() // CRITICAL FOR GODOT 4 PCK LOADING
+					}
+				});
+			}
+
+			return originalFetch.apply(this, arguments);
+		};
+
+const engine = new Engine(GODOT_CONFIG);
+
+		(async function () {
+			const statusOverlay = document.getElementById('status');
+			const statusProgress = document.getElementById('status-progress');
+			const statusNotice = document.getElementById('status-notice');
+
+			function setStatusMode(mode) {
+				statusOverlay.style.visibility = mode === 'hidden' ? 'hidden' : 'visible';
+				statusProgress.style.display = mode === 'progress' ? 'block' : 'none';
+				statusNotice.style.display = mode === 'notice' ? 'block' : 'none';
+			}
+
+			function setStatusNotice(text) {
+				statusNotice.innerText = text;
+				setStatusMode('notice');
+			}
+
+			try {
+				setStatusMode('notice');
+
+				// 1. WASM
+				const wasmData = await ChunkUnpacker.checkAndUnpack('index.wasm', setStatusNotice);
+				if (wasmData) unpackedFiles.set('index.wasm', wasmData);
+
+				// 2. PCK
+				const pckData = await ChunkUnpacker.checkAndUnpack('index.pck', setStatusNotice);
+				if (pckData) unpackedFiles.set('index.pck', pckData);
+
+				// 3. Start Engine
+				setStatusMode('progress');
+				await engine.startGame({
+					'onProgress': function (current, total) {
+						if (current > 0 && total > 0) {
+							statusProgress.value = current;
+							statusProgress.max = total;
+						} else {
+							statusProgress.removeAttribute('value');
+							statusProgress.removeAttribute('max');
+						}
+					},
+				});
+
+				setStatusMode('hidden');
+
+			} catch (err) {
+				console.error(err);
+				setStatusNotice('Error: ' + (err.message || err));
+			}
+		}());
+		</script>
+	</body>
+</html>
+

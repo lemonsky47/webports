@@ -1,0 +1,11 @@
+{
+  "originalFile": "index.pck",
+  "originalSize": 75069024,
+  "compressedSize": 66816582,
+  "chunks": [
+    {"name": "index.pck.part000", "size": 19922944},
+    {"name": "index.pck.part001", "size": 19922944},
+    {"name": "index.pck.part002", "size": 19922944},
+    {"name": "index.pck.part003", "size": 7047750}
+  ]
+}
