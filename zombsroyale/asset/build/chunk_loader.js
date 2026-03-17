@@ -8,51 +8,42 @@
   // Map: original asset URL  →  array of chunk URLs (in order)
   const CHUNK_MAP = {
     "webgl.data.br": [
-        "webgl.data.br.part000",
-        "webgl.data.br.part001",
-        "webgl.data.br.part002",
-        "webgl.data.br.part003",
-        "webgl.data.br.part004",
-        "webgl.data.br.part005",
-        "webgl.data.br.part006"
-    ],
-    "webgl.framework.js.br": [
-        "webgl.framework.js.br.part000"
+      "https://cdn.jsdelivr.net/gh/lemonsky47/webports@main/zombsroyale/asset/build//webgl.data.br.part000",
+      "https://cdn.jsdelivr.net/gh/lemonsky47/webports@main/zombsroyale/asset/build//webgl.data.br.part001",
+      "https://cdn.jsdelivr.net/gh/lemonsky47/webports@main/zombsroyale/asset/build//webgl.data.br.part002",
+      "https://cdn.jsdelivr.net/gh/lemonsky47/webports@main/zombsroyale/asset/build//webgl.data.br.part003",
+      "https://cdn.jsdelivr.net/gh/lemonsky47/webports@main/zombsroyale/asset/build//webgl.data.br.part004",
+      "https://cdn.jsdelivr.net/gh/lemonsky47/webports@main/zombsroyale/asset/build//webgl.data.br.part005",
+      "https://cdn.jsdelivr.net/gh/lemonsky47/webports@main/zombsroyale/asset/build//webgl.data.br.part006"
     ],
     "webgl.wasm.br": [
-        "webgl.wasm.br.part000"
+      "https://cdn.jsdelivr.net/gh/lemonsky47/webports@main/zombsroyale/asset/build//webgl.wasm.br.part000"
     ],
     "/asset/build/webgl.data.br": [
-        "/asset/build/webgl.data.br.part000",
-        "/asset/build/webgl.data.br.part001",
-        "/asset/build/webgl.data.br.part002",
-        "/asset/build/webgl.data.br.part003",
-        "/asset/build/webgl.data.br.part004",
-        "/asset/build/webgl.data.br.part005",
-        "/asset/build/webgl.data.br.part006"
+      "https://cdn.jsdelivr.net/gh/lemonsky47/webports@main/zombsroyale/asset/build//webgl.data.br.part000",
+      "https://cdn.jsdelivr.net/gh/lemonsky47/webports@main/zombsroyale/asset/build//webgl.data.br.part001",
+      "https://cdn.jsdelivr.net/gh/lemonsky47/webports@main/zombsroyale/asset/build//webgl.data.br.part002",
+      "https://cdn.jsdelivr.net/gh/lemonsky47/webports@main/zombsroyale/asset/build//webgl.data.br.part003",
+      "https://cdn.jsdelivr.net/gh/lemonsky47/webports@main/zombsroyale/asset/build//webgl.data.br.part004",
+      "https://cdn.jsdelivr.net/gh/lemonsky47/webports@main/zombsroyale/asset/build//webgl.data.br.part005",
+      "https://cdn.jsdelivr.net/gh/lemonsky47/webports@main/zombsroyale/asset/build//webgl.data.br.part006"
     ],
     "/asset/build/webgl.data.br?vx27099e0b": [
-        "/asset/build/webgl.data.br.part000",
-        "/asset/build/webgl.data.br.part001",
-        "/asset/build/webgl.data.br.part002",
-        "/asset/build/webgl.data.br.part003",
-        "/asset/build/webgl.data.br.part004",
-        "/asset/build/webgl.data.br.part005",
-        "/asset/build/webgl.data.br.part006"
-    ],
-    "/asset/build/webgl.framework.js.br": [
-        "/asset/build/webgl.framework.js.br.part000"
-    ],
-    "/asset/build/webgl.framework.js.br?vx2583de3f": [
-        "/asset/build/webgl.framework.js.br.part000"
+      "https://cdn.jsdelivr.net/gh/lemonsky47/webports@main/zombsroyale/asset/build//webgl.data.br.part000",
+      "https://cdn.jsdelivr.net/gh/lemonsky47/webports@main/zombsroyale/asset/build//webgl.data.br.part001",
+      "https://cdn.jsdelivr.net/gh/lemonsky47/webports@main/zombsroyale/asset/build//webgl.data.br.part002",
+      "https://cdn.jsdelivr.net/gh/lemonsky47/webports@main/zombsroyale/asset/build//webgl.data.br.part003",
+      "https://cdn.jsdelivr.net/gh/lemonsky47/webports@main/zombsroyale/asset/build//webgl.data.br.part004",
+      "https://cdn.jsdelivr.net/gh/lemonsky47/webports@main/zombsroyale/asset/build//webgl.data.br.part005",
+      "https://cdn.jsdelivr.net/gh/lemonsky47/webports@main/zombsroyale/asset/build//webgl.data.br.part006"
     ],
     "/asset/build/webgl.wasm.br": [
-        "/asset/build/webgl.wasm.br.part000"
+      "https://cdn.jsdelivr.net/gh/lemonsky47/webports@main/zombsroyale/asset/build//webgl.wasm.br.part000"
     ],
     "/asset/build/webgl.wasm.br?vx28464856": [
-        "/asset/build/webgl.wasm.br.part000"
+      "https://cdn.jsdelivr.net/gh/lemonsky47/webports@main/zombsroyale/asset/build//webgl.wasm.br.part000"
     ]
-};
+  };
 
   const CACHE_NAME = "unity-zombsroyale";
 
