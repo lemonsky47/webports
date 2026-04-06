@@ -1,0 +1,16 @@
+{
+  "chunks": [
+    {
+      "name": "index.pck.part000",
+      "size": 3556283
+    },
+    {
+      "name": "index.wasm.part000",
+      "size": 20866662
+    },
+    {
+      "name": "index.wasm.part001",
+      "size": 14882519
+    }
+  ]
+}
