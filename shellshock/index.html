@@ -749,96 +749,14 @@
 		aiptag.cmd.player = aiptag.cmd.player || [];
 	</script>
 
-	<script async src="//api.adinplay.com/libs/aiptag/pub/SSK/shellshock.io/tag.min.js"></script>
-	<!-- GTM -->
-	<!-- Google tag (gtag.js) -->
-	<script async src="https://www.googletagmanager.com/gtag/js?id=G-79NWRZXYCB"></script>
 	<script>
-		window.dataLayer = window.dataLayer || [];
-		function gtag() { dataLayer.push(arguments); }
-		gtag('js', new Date());
-		gtag('config', 'G-79NWRZXYCB', gtmOptions);
+		function gtag() {
+
+		}
 	</script>
 
 	<!-- Google Tag Manager -->
-	<script>(function (w, d, s, l, i) {
-			w[l] = w[l] || []; w[l].push({
-				'gtm.start':
-					new Date().getTime(), event: 'gtm.js'
-			}); var f = d.getElementsByTagName(s)[0],
-				j = d.createElement(s), dl = l != 'dataLayer' ? '&l=' + l : ''; j.async = true; j.src =
-					'https://www.googletagmanager.com/gtm.js?id=' + i + dl; f.parentNode.insertBefore(j, f);
-		})(window, document, 'script', 'dataLayer', 'GTM-K5MSJHJ');</script>
-	<!-- End Google Tag Manager --><!-- In house ads -->
-	<script>
-		window.googletag = window.googletag || { cmd: [] };
-		let inHouseSlot;
-		const slots = [];
 
-		const dpfNetwork = /21743024831/,
-			inHouseAdSlot = 'ShellShockers_LoadingScreen_HouseAds'
-		inHouseAdSize = [[468, 60], [970, 90], [970, 250], [728, 90]],
-			inHouseAdDiv = 'ShellShockers_LoadingScreen_HouseAds',
-			adSlots = [];
-
-		// Helper to setup slots and add to slot array
-		const adDefineSlot = (slot, sizes, id) => {
-			return adSlots.push([{ slot, sizes, id }]);
-		};
-
-		// Defining the slots for the the array
-		const loadingScreeningAd = adDefineSlot(inHouseAdSlot, inHouseAdSize, inHouseAdDiv);
-
-		// Helper to add slots to google service
-		function addServiceToSlot() {
-			slots.forEach(slot => {
-				slot.addService(googletag.pubads());
-			});
-		}
-
-		// Get all the slots, add to google ad defineSlot method
-		function getAllDefinedSlots(allSlots) {
-			let definedSlots = [];
-			allSlots.forEach(adSlot => {
-				for (var i = 0, len = adSlot.length; i < len; i++) {
-					slots.push(googletag.defineSlot(dpfNetwork + adSlot[i].slot, adSlot[i].sizes, adSlot[i].id));
-				}
-			})
-			return addServiceToSlot(slots);
-		}
-
-		const gtagInHouseLoadingBannerIntialLoad = () => {
-			if (typeof hasPoki !== 'undefined') {
-				console.log('haspoki', typeof (hasPoki));
-				return;
-			}
-			googletag.cmd.push(function () {
-				getAllDefinedSlots(adSlots);
-				googletag.pubads().disableInitialLoad();
-				googletag.enableServices();
-			});
-		};
-
-		gtagInHouseLoadingBannerIntialLoad();
-
-		const adRenderedEvent = () => {
-			return googletag.pubads().addEventListener('slotRenderEnded', (event) => {
-				vueApp.disaplyAdEventObject(event);
-			});
-		};
-
-		const gtagInHouseLoadingBanner = () => {
-			googletag.cmd.push(function () {
-				googletag.pubads().refresh([slots[0]]);
-				adRenderedEvent();
-			});
-		};
-
-		const destroyInhouseAdForPaid = () => {
-			googletag.destroySlots([slots[0]]);
-		};
-
-	</script><!-- Firebase -->
 	<script src="https://www.gstatic.com/firebasejs/9.17.2/firebase-app-compat.js"></script>
 	<script src="https://www.gstatic.com/firebasejs/9.17.2/firebase-auth-compat.js"></script>
 
@@ -850,7 +768,7 @@
 		!function (f, b, e, v, n, t, s) {
 			if (f.fbq) return; n = f.fbq = function () {
 				n.callMethod ?
-				n.callMethod.apply(n, arguments) : n.queue.push(arguments)
+					n.callMethod.apply(n, arguments) : n.queue.push(arguments)
 			}; if (!f._fbq) f._fbq = n;
 			n.push = n; n.loaded = !0; n.version = '2.0'; n.queue = []; t = b.createElement(e); t.async = !0;
 			t.src = v; s = b.getElementsByTagName(e)[0]; s.parentNode.insertBefore(t, s)
