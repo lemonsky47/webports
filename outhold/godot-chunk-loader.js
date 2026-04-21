@@ -9,7 +9,7 @@
 (function (global) {
   "use strict";
 
-  const DB_NAME    = "GodotChunkCache_OutholdExport";
+  const DB_NAME    = "GodotChunkCache_OutholdExport-v2";
   const STORE_NAME = "chunks";
   const NO_CACHE   = false;
 
