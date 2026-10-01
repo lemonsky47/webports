@@ -1,0 +1,406 @@
+<!doctype html>
+<html lang="en-us">
+
+<head>
+  <meta charset="utf-8" />
+  <meta http-equiv="Content-Type" content="text/html; charset=utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, shrink-to-fit=no, minimum-scale=1, maximum-scale=1" />
+  <title>Balatro — Idle</title>
+
+  <!-- Load custom style sheet -->
+  <link rel="stylesheet" type="text/css" href="theme/love.css" />
+
+  <link rel="icon" type="image/png" href="../theme/icon.png" />
+  <!-- icon from the main site -->
+</head>
+
+<body>
+  <div id="fullscreenDiv">
+    <div id="splash"></div>
+    <button onclick="load()" id="loaderbutton">click to allow audio</button>
+    <div id="header1">
+      <!-- <button onclick="load();">Start game</button> -->
+    </div>
+    <canvas id="loadingCanvas" oncontextmenu="event.preventDefault()" width="800" height="600" display="none"></canvas>
+    <canvas id="canvas" oncontextmenu="event.preventDefault()" display="none"></canvas>
+  </div>
+
+  <script type="text/javascript">
+    function goFullScreen() {
+      var canvas = document.getElementById('canvas');
+      canvas.display = 'block';
+      if (canvas.requestFullScreen) canvas.requestFullScreen();
+      else if (canvas.webkitRequestFullScreen)
+        canvas.webkitRequestFullScreen();
+      else if (canvas.mozRequestFullScreen) canvas.mozRequestFullScreen();
+    }
+
+    function FullScreenHook() {
+      var canvas = document.getElementById('canvas');
+      canvas.width =
+        window.innerWidth ||
+        document.documentElement.clientWidth ||
+        document.body.clientWidth;
+      canvas.height =
+        window.innerHeight ||
+        document.documentElement.clientHeight ||
+        document.body.clientHeight;
+    }
+    // sync the canvas' real draw buffer to the viewport - without this it stays
+    // at its initial size (default 300x150) and everything after is cropped/letterboxed
+    window.addEventListener('resize', FullScreenHook);
+    window.addEventListener('orientationchange', FullScreenHook);
+    FullScreenHook();
+    var loadingContext = document
+      .getElementById('loadingCanvas')
+      .getContext('2d');
+
+    function drawLoadingText(text) {
+      var canvas = loadingContext.canvas;
+
+      loadingContext.fillStyle = 'rgb(142, 195, 227)';
+      loadingContext.fillRect(0, 0, canvas.scrollWidth, canvas.scrollHeight);
+
+      loadingContext.font = '2em arial';
+      loadingContext.textAlign = 'center';
+      loadingContext.fillStyle = 'rgb( 11, 86, 117 )';
+      loadingContext.fillText(
+        text,
+        canvas.scrollWidth / 2,
+        canvas.scrollHeight / 2,
+      );
+
+      loadingContext.fillText(
+        'Powered By Emscripten.',
+        canvas.scrollWidth / 2,
+        canvas.scrollHeight / 4,
+      );
+      loadingContext.fillText(
+        'Powered By LÖVE.',
+        canvas.scrollWidth / 2,
+        (canvas.scrollHeight / 4) * 3,
+      );
+    }
+
+    window.onload = function() {
+      window.focus();
+    };
+    window.onclick = function() {
+      window.focus();
+    };
+
+    window.addEventListener(
+      'keydown',
+      function(e) {
+        // space and arrow keys
+        if ([32, 37, 38, 39, 40].indexOf(e.keyCode) > -1) {
+          e.preventDefault();
+        }
+      },
+      false,
+    );
+
+    let statusText = ['Balatro is loading...'];
+
+    var Module = {
+      arguments: ['./'],
+      INITIAL_MEMORY: 1149289489,
+      printErr: console.error.bind(console),
+      canvas: (function() {
+        var canvas = document.getElementById('canvas');
+
+        // As a default initial behavior, pop up an alert when webgl context is lost. To make your
+        // application robust, you may want to override this behavior before shipping!
+        // See http://www.khronos.org/registry/webgl/specs/latest/1.0/#5.15.2
+        canvas.addEventListener(
+          'webglcontextlost',
+          function(e) {
+            alert('WebGL context lost. You will need to reload the page.');
+            e.preventDefault();
+          },
+          false,
+        );
+
+        return canvas;
+      })(),
+
+      setStatus: function(text) {
+        if (text) {
+          statusText.push(text);
+          const header1 = document.getElementById('header1');
+          const log = document.createElement('p');
+          log.innerText = statusText.at(-1);
+          // console.log(log.getBoundingClientRect().top, window.innerHeight);
+          // console.log(header1.getBoundingClientRect().bottom);
+          // if (log.getBoundingClientRect().y > window.innerHeight) {
+          while (
+            header1.getBoundingClientRect().bottom > window.innerHeight
+          ) {
+            console.log('shifting');
+            // statusText.shift();
+            header1.children[0].remove();
+          }
+          header1.appendChild(log);
+          // header1.innerHTML = '<p>' + statusText.join('</p><p>') + '</p>';
+          // while (
+          //   header1.scrollHeight > header1.clientHeight &&
+          //   statusText.length > 1
+          // ) {
+          //   statusText.shift();
+          //   header1.innerHTML = '<p>' + statusText.join('</p><p>') + '</p>';
+          // }
+        } else if (Module.remainingDependencies === 0) {
+          document.getElementById('loadingCanvas').style.display = 'none';
+          document.getElementById('canvas').style.visibility = 'visible';
+          document.getElementById('header1').remove();
+        }
+        console.log(text);
+      },
+      totalDependencies: 0,
+      remainingDependencies: 0,
+      monitorRunDependencies: function(left) {
+        this.remainingDependencies = left;
+        this.totalDependencies = Math.max(this.totalDependencies, left);
+        Module.setStatus(
+          left ?
+          'Preparing... (' +
+          (this.totalDependencies - left) +
+          '/' +
+          this.totalDependencies +
+          ' ' +
+          parseInt(
+            ((this.totalDependencies - left) / this.totalDependencies) *
+            100,
+          ) +
+          '%)' :
+          'All downloads complete.',
+        );
+      },
+    };
+    // Module.setStatus("Downloading...");
+    window.onerror = function(event) {
+      // TODO: do not warn on ok events like simulating an infinite loop or exitStatus
+      Module.setStatus('Exception thrown, see JavaScript console');
+      Module.setStatus = function(text) {
+        if (text) Module.printErr('[post-exception status] ' + text);
+      };
+    };
+
+    var applicationLoad = function(e) {
+      Love(Module);
+    };
+
+    function load() {
+      applicationLoad(document.getElementById('data'));
+      // document.getElementById("header0").remove();
+      document.getElementById('loaderbutton').remove();
+      // document.getElementById("splash").remove();
+    }
+
+    setTimeout(() => {
+      document.getElementById('splash').style.opacity = 0;
+      setTimeout(() => {
+        document.getElementById('splash').remove();
+      }, 1000);
+    }, 1000);
+
+    // Expose FS, mount IDBFS, sync on start, and setup queue/close hooks for auto-save
+    let isSyncing = false;
+    let pendingSync = false;
+    let syncTimeout = null;
+
+    function triggerSync() {
+      const fsObj = window.FS || (typeof Module !== 'undefined' && Module.FS);
+      if (!fsObj || typeof fsObj.syncfs !== 'function') return;
+
+      if (isSyncing) {
+        pendingSync = true;
+        return;
+      }
+      isSyncing = true;
+      pendingSync = false;
+      fsObj.syncfs(false, function(err) {
+        isSyncing = false;
+        if (pendingSync) {
+          triggerSync();
+        }
+      });
+    }
+
+    function queueSync() {
+      if (syncTimeout) clearTimeout(syncTimeout);
+      syncTimeout = setTimeout(function() {
+        triggerSync();
+      }, 100);
+    }
+
+    if (!Module.preRun) Module.preRun = [];
+    Module.preRun.push(function() {
+      if (Module.FS) {
+        var blacklistPaths = [
+          '/Mods/lovely/blacklist.txt',
+          '/lovely/blacklist.txt',
+          '/Mods/blacklist.txt',
+          '/blacklist.txt'
+      ];
+
+      blacklistPaths.forEach(function(path) {
+          try {
+              if (Module.FS && Module.FS.analyzePath(path).exists) {
+                  Module.FS.unlink(path);
+                  console.log("[Web] Successfully cleared blacklist:", path);
+              }
+          } catch(e) {}
+      });
+
+        window.FS = Module.FS;
+
+        // Hook FS.close to sync saves immediately when written by the game
+        const originalClose = Module.FS.close;
+        Module.FS.close = function(stream) {
+          const res = originalClose.apply(this, arguments);
+          if (
+            stream.node &&
+            stream.node.mount &&
+            stream.node.mount.mountpoint === '/home/web_user/love'
+          ) {
+            queueSync();
+          }
+          return res;
+        };
+      }
+    });
+
+    // Sync on page quit/reload
+    const syncOnExit = () => {
+      triggerSync();
+    };
+    window.addEventListener('beforeunload', syncOnExit);
+    window.addEventListener('unload', syncOnExit);
+
+    // Periodic background sync fallback (every 30 seconds)
+    setInterval(() => {
+      queueSync();
+    }, 30000);
+  </script>
+  <script src="./wisp-client.js"></script>
+<script>
+  // ---------- Safe restart handler ----------
+  window._isRestarting = false;
+  function triggerSyncAndReload(reason) {
+    if (window._isRestarting) return;
+    window._isRestarting = true;
+    console.log('[Restart] Restarting Balatro (' + (reason || 'user clicked Back') + ')...');
+ 
+    const fsObj = (window.LOVE_INTERNAL && window.LOVE_INTERNAL.FS) || (typeof Module !== 'undefined' && Module.FS);
+    if (fsObj && typeof fsObj.syncfs === 'function') {
+      console.log('[Restart] Flushing saves to IndexedDB before reload...');
+      fsObj.syncfs(false, function (err) {
+        if (err) console.error("Sync error:", err);
+        window.location.reload();
+      });
+    } else {
+      window.location.reload();
+    }
+  }
+ 
+  window.addEventListener('error', function (e) {
+    var errStr = String(e.error || e.message || "");
+    if (errStr.includes('ExitStatus')) {
+      triggerSyncAndReload('Game gracefully exited');
+      return true;
+    }
+    console.error("BROWSER THREAD ERROR:", errStr);
+  });
+ 
+  // Lua prints [LÖVE_RESTART] when the game asks to restart (e.g. after toggling a mod).
+  // This must be installed before game.js loads, or Emscripten keeps the original console.log.
+  (function () {
+    const origLog = console.log.bind(console);
+    console.log = function (...args) {
+      origLog(...args);
+      if (typeof args[0] === 'string' && args[0].indexOf('[LÖVE_RESTART]') !== -1) {
+        triggerSyncAndReload('Lua restart');
+      }
+    };
+  })();
+ 
+  // ---------- Multiplayer WebSocket -> Wisp proxy hook ----------
+  (function () {
+    // Pick ONE endpoint:
+    const WISP_ENDPOINT = "ws://localhost:5001/";            // local: npx wisp-js-server --port 5001
+    // const WISP_ENDPOINT = "wss://girlspreples.org/wi/";   // remote
+    const MULTIPLAYER_PORT = 8788;
+    const WS_DEBUG = true;   // set false to silence the [WS] traffic logs
+    const NativeWebSocket = window.WebSocket;
+    const decode = d => typeof d === 'string' ? d : new TextDecoder().decode(d);
+ 
+    window.WebSocket = new Proxy(NativeWebSocket, {
+      construct(target, args) {
+        const url = args[0];
+        const protocols = args[1];
+        const urlStr = String(url);
+ 
+        if (urlStr.startsWith(WISP_ENDPOINT)) {
+          return new target(...args);
+        }
+ 
+        if (urlStr.includes(":" + MULTIPLAYER_PORT) || urlStr.includes("balatro.virtualized.dev")) {
+          console.log("[WebSocket Hook] Intercepting connection for Wisp Proxy!");
+          const targetUrl = new URL(urlStr);
+          const wispUrl = WISP_ENDPOINT + targetUrl.hostname + ":" + (targetUrl.port || MULTIPLAYER_PORT);
+ 
+          const wsw = new window.wisp_client.client.WispWebSocket(wispUrl, protocols, { wisp_version: 2 });
+ 
+          // WispWebSocket doesn't expose readyState or the state constants, and
+          // Emscripten's socket layer compares against them. Without this, connect()
+          // reports "in progress" forever and every send fails with "Socket not connected".
+          const STATES = { CONNECTING: 0, OPEN: 1, CLOSING: 2, CLOSED: 3 };
+          for (const k in STATES) {
+            if (wsw[k] === undefined) {
+              try { Object.defineProperty(wsw, k, { value: STATES[k] }); } catch (e) {}
+            }
+          }
+          let state = 0;
+          try {
+            Object.defineProperty(wsw, 'readyState', { get: () => state, configurable: true });
+          } catch (e) {
+            console.warn('[WS] could not define readyState', e);
+          }
+          wsw.addEventListener('open',  () => { state = 1; });
+          wsw.addEventListener('error', () => { if (state !== 1) state = 3; });
+          wsw.addEventListener('close', (e) => {
+            state = 3;
+            console.warn("[Multiplayer Diagnostic] SERVER DISCONNECTED YOU. Code:", e.code, "Reason:", e.reason);
+          });
+ 
+          window._mpws = wsw;   // inspect from the console: _mpws.readyState
+ 
+          if (WS_DEBUG) {
+            wsw.addEventListener('open',    () => console.log('[WS] open, readyState =', wsw.readyState));
+            wsw.addEventListener('error',   e  => console.log('[WS] error', e));
+            wsw.addEventListener('message', e  => console.log('[WS] <<', decode(e.data)));
+            const origSend = wsw.send.bind(wsw);
+            wsw.send = d => { console.log('[WS] >>', decode(d)); return origSend(d); };
+          }
+ 
+          return wsw;
+        }
+ 
+        // Pass-through for standard connections
+        return new target(...args);
+      }
+    });
+  })();
+</script>
+  <script type="text/javascript" src="game.js"></script>
+  <script async type="text/javascript" src="love.js" id="data"></script>
+  <!-- <script>
+      window.onload = () => {
+        load();
+      };
+    </script> -->
+  <script type="module" src="https://static.cloudflareinsights.com/beacon.min.js/v31edd6df95cf4e85bb4c19e7a9bdbcba1788362987495" integrity="sha512-iIg7k2xntmwu6/uSb5tpc/hySgZc4eoL31yB29W6tJFo2akwjPWcEqnCEdJvGexCL0KEQwVYv5BlowfhVz26hg==" data-cf-beacon='{"version":"2024.11.0","token":"f9d9464f4a284462a58742b487ede846","r":1,"spa":2}' crossorigin="anonymous"></script>
+</body>
+
+</html>

@@ -1,0 +1,81 @@
+* {
+  box-sizing: border-box;
+}
+
+body {
+  overflow: hidden;
+  padding: 0;
+  margin: 0;
+  background-color: #000;
+}
+
+@font-face {
+  font-family: "balatro";
+  src: url("balatro.ttf");
+}
+
+p {
+  /* font-family: balatro; */
+  color: #fff;
+}
+
+#header0 {
+  font-family: balatro;
+  font-size: 20px;
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  color: #fff;
+  background: #0000;
+  border: 0px none;
+}
+
+#header1 {
+  position: absolute;
+  top: 0;
+  left: 0;
+  font-family: monospace;
+}
+
+/* the canvas *must not* have any border or padding, or mouse coords will be wrong */
+#canvas {
+  padding-right: 0;
+  display: block;
+  border: 0px none;
+  visibility: hidden;
+  width: 100%;
+  height: 100%;
+  position: absolute;
+  top: 0;
+  left: 0;
+  padding: 0;
+  margin: 0;
+}
+
+button {
+  position: absolute;
+  top: 0;
+  left: 0;
+  padding: 0;
+  margin: 0;
+  width: 100vw;
+  height: 100vh;
+  border: 0px none;
+  background: #d3d7dd;
+  font-family: "balatro";
+  color: #000;
+  font-size: 2rem;
+}
+
+#splash {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 100vw;
+  height: 100vh;
+  background: url("splash.png") no-repeat center center / cover;
+  transition: opacity 1s ease-in-out;
+  z-index: 9999;
+  /* sits on top of everything */
+}
