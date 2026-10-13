@@ -9,18 +9,45 @@
 
   <!-- Load custom style sheet -->
   <link rel="stylesheet" type="text/css" href="theme/love.css" />
-
   <link rel="icon" type="image/png" href="../theme/icon.png" />
-  <!-- icon from the main site -->
+
+  <style>
+    /* 
+     * Protect our UI elements from love.css which forces ALL <button> tags 
+     * to be position: absolute, width: 100vw, and height: 100vh.
+     */
+    #modSelector button, #loaderbutton {
+      position: relative !important;
+      width: auto !important;
+      height: auto !important;
+      top: auto !important;
+      left: auto !important;
+      margin: 0 auto !important;
+    }
+    
+    #loaderbutton {
+      position: absolute !important;
+      top: 50% !important;
+      left: 50% !important;
+    }
+  </style>
 </head>
 
 <body>
   <div id="fullscreenDiv">
-    <div id="splash"></div>
-    <button onclick="load()" id="loaderbutton">click to allow audio</button>
-    <div id="header1">
-      <!-- <button onclick="load();">Start game</button> -->
+    
+    <!-- Mod Selector UI -->
+    <div id="modSelector" style="display: none; position: absolute; z-index: 100; top: 50%; left: 50%; transform: translate(-50%, -50%); background: rgba(0,0,0,0.85); color: white; padding: 20px; border-radius: 10px; border: 2px solid #555; max-height: 80vh; min-width: 300px; overflow-y: auto; font-family: sans-serif; box-shadow: 0 0 20px rgba(0,0,0,0.8);">
+        <h2 style="margin-top: 0; text-align: center; border-bottom: 1px solid #555; padding-bottom: 10px;">Select Mods</h2>
+        <div id="modList" style="text-align: left; margin-bottom: 20px; display: flex; flex-direction: column; gap: 8px;"></div>
+        <div style="text-align: center;">
+            <button id="startGameBtn" style="padding: 10px 20px; font-size: 1.2em; cursor: pointer; background: #3a3a3a; color: white; border: 1px solid #777; border-radius: 5px; transition: background 0.2s;">Start Game</button>
+        </div>
     </div>
+    
+    <button id="loaderbutton" style="display: none; position: absolute; z-index: 100; top: 50%; left: 50%; transform: translate(-50%, -50%); padding: 10px 20px; font-size: 1.2em; cursor: pointer; background: #3a3a3a; color: white; border: 1px solid #777; border-radius: 5px;">Click to Start</button>
+
+    <div id="header1"></div>
     <canvas id="loadingCanvas" oncontextmenu="event.preventDefault()" width="800" height="600" display="none"></canvas>
     <canvas id="canvas" oncontextmenu="event.preventDefault()" display="none"></canvas>
   </div>
@@ -30,75 +57,38 @@
       var canvas = document.getElementById('canvas');
       canvas.display = 'block';
       if (canvas.requestFullScreen) canvas.requestFullScreen();
-      else if (canvas.webkitRequestFullScreen)
-        canvas.webkitRequestFullScreen();
+      else if (canvas.webkitRequestFullScreen) canvas.webkitRequestFullScreen();
       else if (canvas.mozRequestFullScreen) canvas.mozRequestFullScreen();
     }
 
     function FullScreenHook() {
       var canvas = document.getElementById('canvas');
-      canvas.width =
-        window.innerWidth ||
-        document.documentElement.clientWidth ||
-        document.body.clientWidth;
-      canvas.height =
-        window.innerHeight ||
-        document.documentElement.clientHeight ||
-        document.body.clientHeight;
+      canvas.width = window.innerWidth || document.documentElement.clientWidth || document.body.clientWidth;
+      canvas.height = window.innerHeight || document.documentElement.clientHeight || document.body.clientHeight;
     }
-    // sync the canvas' real draw buffer to the viewport - without this it stays
-    // at its initial size (default 300x150) and everything after is cropped/letterboxed
     window.addEventListener('resize', FullScreenHook);
     window.addEventListener('orientationchange', FullScreenHook);
     FullScreenHook();
-    var loadingContext = document
-      .getElementById('loadingCanvas')
-      .getContext('2d');
+    
+    var loadingContext = document.getElementById('loadingCanvas').getContext('2d');
 
     function drawLoadingText(text) {
       var canvas = loadingContext.canvas;
-
       loadingContext.fillStyle = 'rgb(142, 195, 227)';
       loadingContext.fillRect(0, 0, canvas.scrollWidth, canvas.scrollHeight);
-
       loadingContext.font = '2em arial';
       loadingContext.textAlign = 'center';
       loadingContext.fillStyle = 'rgb( 11, 86, 117 )';
-      loadingContext.fillText(
-        text,
-        canvas.scrollWidth / 2,
-        canvas.scrollHeight / 2,
-      );
-
-      loadingContext.fillText(
-        'Powered By Emscripten.',
-        canvas.scrollWidth / 2,
-        canvas.scrollHeight / 4,
-      );
-      loadingContext.fillText(
-        'Powered By LÖVE.',
-        canvas.scrollWidth / 2,
-        (canvas.scrollHeight / 4) * 3,
-      );
+      loadingContext.fillText(text, canvas.scrollWidth / 2, canvas.scrollHeight / 2);
+      loadingContext.fillText('Powered By Emscripten.', canvas.scrollWidth / 2, canvas.scrollHeight / 4);
+      loadingContext.fillText('Powered By LÖVE.', canvas.scrollWidth / 2, (canvas.scrollHeight / 4) * 3);
     }
 
-    window.onload = function() {
-      window.focus();
-    };
-    window.onclick = function() {
-      window.focus();
-    };
-
-    window.addEventListener(
-      'keydown',
-      function(e) {
-        // space and arrow keys
-        if ([32, 37, 38, 39, 40].indexOf(e.keyCode) > -1) {
-          e.preventDefault();
-        }
-      },
-      false,
-    );
+    window.onload = function() { window.focus(); };
+    window.onclick = function() { window.focus(); };
+    window.addEventListener('keydown', function(e) {
+      if ([32, 37, 38, 39, 40].indexOf(e.keyCode) > -1) { e.preventDefault(); }
+    }, false);
 
     let statusText = ['Balatro is loading...'];
 
@@ -108,103 +98,187 @@
       printErr: console.error.bind(console),
       canvas: (function() {
         var canvas = document.getElementById('canvas');
-
-        // As a default initial behavior, pop up an alert when webgl context is lost. To make your
-        // application robust, you may want to override this behavior before shipping!
-        // See http://www.khronos.org/registry/webgl/specs/latest/1.0/#5.15.2
-        canvas.addEventListener(
-          'webglcontextlost',
-          function(e) {
+        canvas.addEventListener('webglcontextlost', function(e) {
             alert('WebGL context lost. You will need to reload the page.');
             e.preventDefault();
-          },
-          false,
-        );
-
+        }, false);
         return canvas;
       })(),
-
       setStatus: function(text) {
         if (text) {
           statusText.push(text);
           const header1 = document.getElementById('header1');
           const log = document.createElement('p');
           log.innerText = statusText.at(-1);
-          // console.log(log.getBoundingClientRect().top, window.innerHeight);
-          // console.log(header1.getBoundingClientRect().bottom);
-          // if (log.getBoundingClientRect().y > window.innerHeight) {
-          while (
-            header1.getBoundingClientRect().bottom > window.innerHeight
-          ) {
-            console.log('shifting');
-            // statusText.shift();
+          while (header1.getBoundingClientRect().bottom > window.innerHeight) {
             header1.children[0].remove();
           }
           header1.appendChild(log);
-          // header1.innerHTML = '<p>' + statusText.join('</p><p>') + '</p>';
-          // while (
-          //   header1.scrollHeight > header1.clientHeight &&
-          //   statusText.length > 1
-          // ) {
-          //   statusText.shift();
-          //   header1.innerHTML = '<p>' + statusText.join('</p><p>') + '</p>';
-          // }
         } else if (Module.remainingDependencies === 0) {
           document.getElementById('loadingCanvas').style.display = 'none';
           document.getElementById('canvas').style.visibility = 'visible';
           document.getElementById('header1').remove();
         }
-        console.log(text);
       },
       totalDependencies: 0,
       remainingDependencies: 0,
       monitorRunDependencies: function(left) {
         this.remainingDependencies = left;
         this.totalDependencies = Math.max(this.totalDependencies, left);
-        Module.setStatus(
-          left ?
-          'Preparing... (' +
-          (this.totalDependencies - left) +
-          '/' +
-          this.totalDependencies +
-          ' ' +
-          parseInt(
-            ((this.totalDependencies - left) / this.totalDependencies) *
-            100,
-          ) +
-          '%)' :
-          'All downloads complete.',
-        );
+        Module.setStatus(left ? 'Preparing... (' + (this.totalDependencies - left) + '/' + this.totalDependencies + ' ' +
+          parseInt(((this.totalDependencies - left) / this.totalDependencies) * 100) + '%)' : 'All downloads complete.');
       },
     };
-    // Module.setStatus("Downloading...");
+    
     window.onerror = function(event) {
-      // TODO: do not warn on ok events like simulating an infinite loop or exitStatus
       Module.setStatus('Exception thrown, see JavaScript console');
-      Module.setStatus = function(text) {
-        if (text) Module.printErr('[post-exception status] ' + text);
-      };
+      Module.setStatus = function(text) { if (text) Module.printErr('[post-exception status] ' + text); };
     };
 
-    var applicationLoad = function(e) {
-      Love(Module);
+    var applicationLoad = function(e) { Love(Module); };
+
+    function showLoaderBtn() {
+      let btn = document.getElementById('loaderbutton');
+      btn.style.display = 'block';
+      btn.onclick = load;
+    }
+
+   // --- MOD SELECTOR LOGIC ---
+    fetch('data/available_mods.json')
+      .then(res => {
+          if (!res.ok) throw new Error("HTTP error " + res.status);
+          return res.json();
+      })
+      .then(fetchedMods => {
+        if (fetchedMods && fetchedMods.length > 0) {
+          let mods = fetchedMods.map(m => typeof m === 'string' ? { folder: m, id: m, dependencies: [] } : m);
+          let savedState = JSON.parse(localStorage.getItem('balatro_mods_state') || '{}');
+          let modList = document.getElementById('modList');
+
+          // Helper: clean dependency string like "Talisman (>=2.7)" -> "talisman"
+          function cleanId(raw) {
+            if (!raw) return "";
+            return raw.replace(/\s*\(.*?\)/g, '')
+                      .replace(/[><=\~].*$/g, '')
+                      .trim()
+                      .toLowerCase();
+          }
+
+          // Helper to find a mod by clean ID or folder name
+          function findModByDep(depName) {
+            let target = cleanId(depName);
+            if (target === "steamodded" || target === "lovely" || target === "balatro") return null;
+            return mods.find(m => {
+              let mId = cleanId(m.id);
+              let mFolder = cleanId(m.folder);
+              return mId === target || mFolder === target || mFolder.startsWith(target + "-");
+            });
+          }
+
+          // Recursive check handler
+          function handleCheckChange(folder, isChecked) {
+            let mod = mods.find(m => m.folder === folder);
+            if (!mod) return;
+
+            if (isChecked) {
+              // Check all dependencies
+              if (mod.dependencies) {
+                mod.dependencies.forEach(rawDep => {
+                  let depMod = findModByDep(rawDep);
+                  if (depMod) {
+                    let depCb = document.getElementById('mod-cb-' + depMod.folder);
+                    if (depCb && !depCb.checked) {
+                      depCb.checked = true;
+                      handleCheckChange(depMod.folder, true);
+                    }
+                  }
+                });
+              }
+            } else {
+              // Uncheck anything that depends on this mod
+              mods.forEach(otherMod => {
+                if (otherMod.dependencies) {
+                  let dependsOnThis = otherMod.dependencies.some(rawDep => {
+                    let depMod = findModByDep(rawDep);
+                    return depMod && depMod.folder === mod.folder;
+                  });
+                  if (dependsOnThis) {
+                    let otherCb = document.getElementById('mod-cb-' + otherMod.folder);
+                    if (otherCb && otherCb.checked) {
+                      otherCb.checked = false;
+                      handleCheckChange(otherMod.folder, false);
+                    }
+                  }
+                }
+              });
+            }
+          }
+
+          // Build UI
+          mods.forEach(mod => {
+            let label = document.createElement('label');
+            label.style.display = 'flex';
+            label.style.alignItems = 'center';
+            label.style.cursor = 'pointer';
+            
+            let cb = document.createElement('input');
+            cb.type = 'checkbox';
+            cb.id = 'mod-cb-' + mod.folder;
+            cb.value = mod.folder;
+            cb.style.marginRight = '10px';
+            cb.style.transform = 'scale(1.2)';
+            cb.checked = savedState[mod.folder] !== false;
+            
+            cb.addEventListener('change', (e) => {
+               handleCheckChange(mod.folder, e.target.checked);
+            });
+            
+            label.appendChild(cb);
+            label.appendChild(document.createTextNode(mod.folder));
+            modList.appendChild(label);
+          });
+          
+          // Enforce dependencies on startup
+          mods.forEach(mod => {
+            let cb = document.getElementById('mod-cb-' + mod.folder);
+            if (cb && cb.checked) handleCheckChange(mod.folder, true);
+          });
+
+          document.getElementById('modSelector').style.display = 'block';
+        } else {
+          showLoaderBtn();
+        }
+      })
+      .catch(e => {
+          console.warn("No available_mods.json found, skipping mod selector.", e);
+          showLoaderBtn();
+      });
+
+    document.getElementById('startGameBtn').onclick = () => {
+        let disabled = [];
+        let stateToSave = {};
+        document.getElementById('modList').querySelectorAll('input[type="checkbox"]').forEach(cb => {
+            stateToSave[cb.value] = cb.checked;
+            if (!cb.checked) disabled.push(cb.value);
+        });
+        localStorage.setItem('balatro_mods_state', JSON.stringify(stateToSave));
+        window.disabledModsString = disabled.join('\n');
+        
+        document.getElementById('modSelector').style.display = 'none';
+        load();
     };
 
     function load() {
+      if (window.disabledModsString !== undefined) {
+          Module.arguments.push('--web-blacklist');
+          Module.arguments.push(window.disabledModsString);
+      }
       applicationLoad(document.getElementById('data'));
-      // document.getElementById("header0").remove();
-      document.getElementById('loaderbutton').remove();
-      // document.getElementById("splash").remove();
+      let loaderBtn = document.getElementById('loaderbutton');
+      if (loaderBtn) loaderBtn.remove();
     }
 
-    setTimeout(() => {
-      document.getElementById('splash').style.opacity = 0;
-      setTimeout(() => {
-        document.getElementById('splash').remove();
-      }, 1000);
-    }, 1000);
-
-    // Expose FS, mount IDBFS, sync on start, and setup queue/close hooks for auto-save
+    // --- SAVING HOOKS (FIXED FOR CRYPTID) ---
     let isSyncing = false;
     let pendingSync = false;
     let syncTimeout = null;
@@ -213,57 +287,29 @@
       const fsObj = window.FS || (typeof Module !== 'undefined' && Module.FS);
       if (!fsObj || typeof fsObj.syncfs !== 'function') return;
 
-      if (isSyncing) {
-        pendingSync = true;
-        return;
-      }
+      if (isSyncing) { pendingSync = true; return; }
       isSyncing = true;
       pendingSync = false;
       fsObj.syncfs(false, function(err) {
         isSyncing = false;
-        if (pendingSync) {
-          triggerSync();
-        }
+        if (pendingSync) triggerSync();
       });
     }
 
     function queueSync() {
       if (syncTimeout) clearTimeout(syncTimeout);
-      syncTimeout = setTimeout(function() {
-        triggerSync();
-      }, 100);
+      syncTimeout = setTimeout(function() { triggerSync(); }, 100);
     }
 
     if (!Module.preRun) Module.preRun = [];
     Module.preRun.push(function() {
       if (Module.FS) {
-        var blacklistPaths = [
-          '/Mods/lovely/blacklist.txt',
-          '/lovely/blacklist.txt',
-          '/Mods/blacklist.txt',
-          '/blacklist.txt'
-      ];
-
-      blacklistPaths.forEach(function(path) {
-          try {
-              if (Module.FS && Module.FS.analyzePath(path).exists) {
-                  Module.FS.unlink(path);
-                  console.log("[Web] Successfully cleared blacklist:", path);
-              }
-          } catch(e) {}
-      });
-
         window.FS = Module.FS;
-
-        // Hook FS.close to sync saves immediately when written by the game
         const originalClose = Module.FS.close;
         Module.FS.close = function(stream) {
           const res = originalClose.apply(this, arguments);
-          if (
-            stream.node &&
-            stream.node.mount &&
-            stream.node.mount.mountpoint === '/home/web_user/love'
-          ) {
+          // Only trigger a sync when a file was opened with write/append access
+          if (stream && stream.flags !== 0) {
             queueSync();
           }
           return res;
@@ -271,136 +317,97 @@
       }
     });
 
-    // Sync on page quit/reload
-    const syncOnExit = () => {
-      triggerSync();
-    };
+    const syncOnExit = () => triggerSync();
     window.addEventListener('beforeunload', syncOnExit);
     window.addEventListener('unload', syncOnExit);
-
-    // Periodic background sync fallback (every 30 seconds)
-    setInterval(() => {
-      queueSync();
-    }, 30000);
+    setInterval(() => queueSync(), 30000); // 30s background save
   </script>
+
   <script src="./wisp-client.js"></script>
-<script>
-  // ---------- Safe restart handler ----------
-  window._isRestarting = false;
-  function triggerSyncAndReload(reason) {
-    if (window._isRestarting) return;
-    window._isRestarting = true;
-    console.log('[Restart] Restarting Balatro (' + (reason || 'user clicked Back') + ')...');
- 
-    const fsObj = (window.LOVE_INTERNAL && window.LOVE_INTERNAL.FS) || (typeof Module !== 'undefined' && Module.FS);
-    if (fsObj && typeof fsObj.syncfs === 'function') {
-      console.log('[Restart] Flushing saves to IndexedDB before reload...');
-      fsObj.syncfs(false, function (err) {
-        if (err) console.error("Sync error:", err);
+  <script>
+    window._isRestarting = false;
+    function triggerSyncAndReload(reason) {
+      if (window._isRestarting) return;
+      window._isRestarting = true;
+      console.log('[Restart] Restarting Balatro (' + (reason || 'user clicked Back') + ')...');
+   
+      const fsObj = (window.LOVE_INTERNAL && window.LOVE_INTERNAL.FS) || (typeof Module !== 'undefined' && Module.FS);
+      if (fsObj && typeof fsObj.syncfs === 'function') {
+        console.log('[Restart] Flushing saves to IndexedDB before reload...');
+        fsObj.syncfs(false, function (err) {
+          if (err) console.error("Sync error:", err);
+          window.location.reload();
+        });
+      } else {
         window.location.reload();
-      });
-    } else {
-      window.location.reload();
-    }
-  }
- 
-  window.addEventListener('error', function (e) {
-    var errStr = String(e.error || e.message || "");
-    if (errStr.includes('ExitStatus')) {
-      triggerSyncAndReload('Game gracefully exited');
-      return true;
-    }
-    console.error("BROWSER THREAD ERROR:", errStr);
-  });
- 
-  // Lua prints [LÖVE_RESTART] when the game asks to restart (e.g. after toggling a mod).
-  // This must be installed before game.js loads, or Emscripten keeps the original console.log.
-  (function () {
-    const origLog = console.log.bind(console);
-    console.log = function (...args) {
-      origLog(...args);
-      if (typeof args[0] === 'string' && args[0].indexOf('[LÖVE_RESTART]') !== -1) {
-        triggerSyncAndReload('Lua restart');
       }
-    };
-  })();
- 
-  // ---------- Multiplayer WebSocket -> Wisp proxy hook ----------
-  (function () {
-    // Pick ONE endpoint:
-    const WISP_ENDPOINT = "ws://localhost:5001/";            // local: npx wisp-js-server --port 5001
-    // const WISP_ENDPOINT = "wss://girlspreples.org/wi/";   // remote
-    const MULTIPLAYER_PORT = 8788;
-    const WS_DEBUG = true;   // set false to silence the [WS] traffic logs
-    const NativeWebSocket = window.WebSocket;
-    const decode = d => typeof d === 'string' ? d : new TextDecoder().decode(d);
- 
-    window.WebSocket = new Proxy(NativeWebSocket, {
-      construct(target, args) {
-        const url = args[0];
-        const protocols = args[1];
-        const urlStr = String(url);
- 
-        if (urlStr.startsWith(WISP_ENDPOINT)) {
+    }
+   
+    window.addEventListener('error', function (e) {
+      var errStr = String(e.error || e.message || "");
+      if (errStr.includes('ExitStatus')) {
+        triggerSyncAndReload('Game gracefully exited');
+        return true;
+      }
+      console.error("BROWSER THREAD ERROR:", errStr);
+    });
+   
+    (function () {
+      const origLog = console.log.bind(console);
+      console.log = function (...args) {
+        origLog(...args);
+        if (typeof args[0] === 'string' && args[0].indexOf('[LÖVE_RESTART]') !== -1) {
+          triggerSyncAndReload('Lua restart');
+        }
+      };
+    })();
+   
+    (function () {
+      const WISP_ENDPOINT = "wss://girlspreples.org/wi/";
+      const MULTIPLAYER_PORT = 8788;
+      const WS_DEBUG = true;
+      const NativeWebSocket = window.WebSocket;
+      const decode = d => typeof d === 'string' ? d : new TextDecoder().decode(d);
+   
+      window.WebSocket = new Proxy(NativeWebSocket, {
+        construct(target, args) {
+          const url = args[0];
+          const protocols = args[1];
+          const urlStr = String(url);
+   
+          if (urlStr.startsWith(WISP_ENDPOINT)) {
+            return new target(...args);
+          }
+   
+          if (urlStr.includes(":" + MULTIPLAYER_PORT) || urlStr.includes("balatro.virtualized.dev")) {
+            const targetUrl = new URL(urlStr);
+            const wispUrl = WISP_ENDPOINT + targetUrl.hostname + ":" + (targetUrl.port || MULTIPLAYER_PORT);
+   
+            const wsw = new window.wisp_client.client.WispWebSocket(wispUrl, protocols, { wisp_version: 2 });
+   
+            const STATES = { CONNECTING: 0, OPEN: 1, CLOSING: 2, CLOSED: 3 };
+            for (const k in STATES) {
+              if (wsw[k] === undefined) {
+                try { Object.defineProperty(wsw, k, { value: STATES[k] }); } catch (e) {}
+              }
+            }
+            let state = 0;
+            try { Object.defineProperty(wsw, 'readyState', { get: () => state, configurable: true }); } catch (e) {}
+            
+            wsw.addEventListener('open',  () => { state = 1; });
+            wsw.addEventListener('error', () => { if (state !== 1) state = 3; });
+            wsw.addEventListener('close', (e) => { state = 3; });
+   
+            window._mpws = wsw;
+            return wsw;
+          }
+   
           return new target(...args);
         }
- 
-        if (urlStr.includes(":" + MULTIPLAYER_PORT) || urlStr.includes("balatro.virtualized.dev")) {
-          console.log("[WebSocket Hook] Intercepting connection for Wisp Proxy!");
-          const targetUrl = new URL(urlStr);
-          const wispUrl = WISP_ENDPOINT + targetUrl.hostname + ":" + (targetUrl.port || MULTIPLAYER_PORT);
- 
-          const wsw = new window.wisp_client.client.WispWebSocket(wispUrl, protocols, { wisp_version: 2 });
- 
-          // WispWebSocket doesn't expose readyState or the state constants, and
-          // Emscripten's socket layer compares against them. Without this, connect()
-          // reports "in progress" forever and every send fails with "Socket not connected".
-          const STATES = { CONNECTING: 0, OPEN: 1, CLOSING: 2, CLOSED: 3 };
-          for (const k in STATES) {
-            if (wsw[k] === undefined) {
-              try { Object.defineProperty(wsw, k, { value: STATES[k] }); } catch (e) {}
-            }
-          }
-          let state = 0;
-          try {
-            Object.defineProperty(wsw, 'readyState', { get: () => state, configurable: true });
-          } catch (e) {
-            console.warn('[WS] could not define readyState', e);
-          }
-          wsw.addEventListener('open',  () => { state = 1; });
-          wsw.addEventListener('error', () => { if (state !== 1) state = 3; });
-          wsw.addEventListener('close', (e) => {
-            state = 3;
-            console.warn("[Multiplayer Diagnostic] SERVER DISCONNECTED YOU. Code:", e.code, "Reason:", e.reason);
-          });
- 
-          window._mpws = wsw;   // inspect from the console: _mpws.readyState
- 
-          if (WS_DEBUG) {
-            wsw.addEventListener('open',    () => console.log('[WS] open, readyState =', wsw.readyState));
-            wsw.addEventListener('error',   e  => console.log('[WS] error', e));
-            wsw.addEventListener('message', e  => console.log('[WS] <<', decode(e.data)));
-            const origSend = wsw.send.bind(wsw);
-            wsw.send = d => { console.log('[WS] >>', decode(d)); return origSend(d); };
-          }
- 
-          return wsw;
-        }
- 
-        // Pass-through for standard connections
-        return new target(...args);
-      }
-    });
-  })();
-</script>
+      });
+    })();
+  </script>
   <script type="text/javascript" src="game.js"></script>
   <script async type="text/javascript" src="love.js" id="data"></script>
-  <!-- <script>
-      window.onload = () => {
-        load();
-      };
-    </script> -->
-  <script type="module" src="https://static.cloudflareinsights.com/beacon.min.js/v31edd6df95cf4e85bb4c19e7a9bdbcba1788362987495" integrity="sha512-iIg7k2xntmwu6/uSb5tpc/hySgZc4eoL31yB29W6tJFo2akwjPWcEqnCEdJvGexCL0KEQwVYv5BlowfhVz26hg==" data-cf-beacon='{"version":"2024.11.0","token":"f9d9464f4a284462a58742b487ede846","r":1,"spa":2}' crossorigin="anonymous"></script>
 </body>
-
 </html>
