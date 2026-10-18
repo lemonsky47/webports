@@ -674,7 +674,7 @@
       var resumeButton = document.getElementById("resumeButton");
       var quitButton = document.getElementById("quitButton");
       canvasElement.addEventListener("click", function() { canvasElement.focus(); });
-      
+
       const messageContainerElement = document.getElementById("message-container");
       const messagesElement = document.getElementById("messages");
       let rollbackMessages = [];
@@ -862,7 +862,7 @@
       }
 
       var g_pWadLoadCallback = undefined;
-      function setWadLoadCallback( _wadLoadCallback ) 
+      function setWadLoadCallback( _wadLoadCallback )
       {
         g_pWadLoadCallback = _wadLoadCallback;
       }
@@ -972,7 +972,7 @@
            // trigger _callback_adBreakDone to game
            doGMLCallback( pCallbackAdBreakDone, { id:adId } );
            triggerAdPostfix( pRValueCopy );
-         }, 
+         },
        });
       }
 
@@ -980,7 +980,7 @@
         var pRValueCopy = triggerPaymentPrefix(_callback_PaymentComplete);
         setTimeout(() => {
           console.log("triggerPayment");
-          doGMLCallback(pRValueCopy, { id:itemId });        
+          doGMLCallback(pRValueCopy, { id:itemId });
         }, 1000);
         triggerPaymentPostfix();
       }
@@ -993,7 +993,7 @@
         if (!CHANGE_ASPECT_RATIO) {
           return;
         }
-        
+
         if (startingHeight === undefined && startingWidth === undefined) {
           return;
         }
@@ -1026,7 +1026,7 @@
         if (!canvasElement.classList.contains("active")) { // Wait for the canvas to load.
           return
         }
-        
+
         GM_pause();
         pauseMenu.hidden = false;
         canvasElement.classList.add("paused");
@@ -1383,7 +1383,7 @@
           if (definition.type === "file" || definition.type === "folder") {
             return create_not_supported_elem(definition, config);
           }
-          
+
           console.log("missing config value for: ", definition);
           return null;
       }
@@ -1478,7 +1478,7 @@
         const checkboxElem = document.createElement("input");
         checkboxElem.type = "checkbox";
         checkboxElem.checked = value;
-        
+
         config[definition.name] = value;
         checkboxElem.addEventListener("change", (e) => {
           const valueUpdate = Boolean(e.target.checked);
@@ -1518,7 +1518,7 @@
 
         colorElem.addEventListener("change", color_value_updated, false);
         colorElem.addEventListener("input", color_value_updated, false);
-        
+
         return wrap_with_label(colorElem, definition, prefixId);
       }
 
@@ -1538,7 +1538,7 @@
           config[definition.name] = e.target.value;
           notify_config_change();
         });
-        
+
         return wrap_with_label(textElem, definition, prefixId);
       }
 
@@ -1558,7 +1558,7 @@
           config[definition.name] = e.target.value;
           notify_config_change();
         });
-        
+
         return wrap_with_label(textareaElem, definition, prefixId);
       }
 
@@ -1567,7 +1567,7 @@
 
         const selectElem = document.createElement("select");
         selectElem.value = value;
-        
+
         const options = definition.options || [];
         options.forEach(o => {
           const option = document.createElement("option");
@@ -1583,7 +1583,7 @@
           config[definition.name] = e.target.value;
           notify_config_change();
         });
-        
+
         return wrap_with_label(selectElem, definition, prefixId);
       }
 
@@ -1603,6 +1603,57 @@
       }
     </script>
     <script type="text/javascript">
+// Hold E to act as the left mouse button, so it can be held while right-clicking on the
+// trackpad. Change CLICK_KEY, or set SWALLOW_KEY to false if the game itself uses E.
+(() => {
+  const CLICK_KEY = "KeyE";
+  const SWALLOW_KEY = true;
+  const ours = new WeakSet();   // synthetic events we dispatched ourselves
+  let held = false, realButtons = 0, x = 0, y = 0, haveMouse = false;
+
+  // Track the real pointer, and while E is held make real events report the left button as down too.
+  ["mousemove", "mousedown", "mouseup"].forEach((type) =>
+    window.addEventListener(type, (e) => {
+      if (ours.has(e)) return;
+      x = e.clientX; y = e.clientY; haveMouse = true;
+      realButtons = e.buttons;
+      if (held) Object.defineProperty(e, "buttons", { value: e.buttons | 1 });
+    }, true));
+
+  function fire(type, buttons) {
+    const canvas = document.getElementById("canvas");
+    if (!canvas) return;
+    if (!haveMouse) {
+      const r = canvas.getBoundingClientRect();
+      x = r.left + r.width / 2; y = r.top + r.height / 2;
+    }
+    const ev = new MouseEvent(type, { bubbles: true, cancelable: true, view: window, clientX: x, clientY: y,
+      screenX: x + window.screenX, screenY: y + window.screenY, button: 0, buttons, detail: 1 });
+    ours.add(ev);
+    canvas.dispatchEvent(ev);
+  }
+  const press = () => { if (!held) { held = true; fire("mousedown", realButtons | 1); } };
+  const release = () => { if (held) { held = false; fire("mouseup", realButtons); } };
+
+  window.addEventListener("keydown", (e) => {
+    if (e.code !== CLICK_KEY || e.ctrlKey || e.metaKey || e.altKey) return;
+    if (SWALLOW_KEY) { e.preventDefault(); e.stopImmediatePropagation(); }
+    if (!e.repeat) press();
+  }, true);
+  window.addEventListener("keyup", (e) => {
+    if (e.code !== CLICK_KEY) return;
+    if (SWALLOW_KEY) { e.preventDefault(); e.stopImmediatePropagation(); }
+    release();
+  }, true);
+
+  // Never leave the button stuck down if focus is lost.
+  window.addEventListener("blur", release);
+  document.addEventListener("visibilitychange", () => { if (document.hidden) release(); });
+  // Stop the browser's right-click menu from popping up over the game.
+  window.addEventListener("contextmenu", (e) => e.preventDefault(), true);
+})();
+</script>
+<script type="text/javascript">
 // Merge the .partN pieces listed in parts/parts.json back into whole files in the browser,
 // then start runner.js. If parts/parts.json is absent, everything loads normally.
 const PARTS_DIR = "parts/";   // folder holding parts.json and all the .partN files
