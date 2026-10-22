@@ -63,89 +63,97 @@ Module.expectedDataFileDownloads++;
 
     // Always load from local chunked data files
     var CHUNK_SIZE = 19000000;
-    var TOTAL_CHUNKS = 8; // game.data.000 through game.data.007
+    var TOTAL_CHUNKS = 6; // game.data.000 through game.data.005
     var REMOTE_PACKAGE_SIZE = metadata.remote_package_size;
     var PACKAGE_UUID = metadata.package_uuid;
 
+    var MAX_CHUNK_RETRIES = 3;
+
+    function chunkLength(i, packageSize) {
+      return Math.min(CHUNK_SIZE, packageSize - CHUNK_SIZE * i);
+    }
+
+    // Downloads every chunk straight into one preallocated buffer, so the package is only held in memory once
+    // (low-memory devices such as Chromebooks could not afford chunks + combined copy + heap copy + IDB copy).
     function fetchRemotePackage(packageName, packageSize, callback, errback) {
       if (!Module.dataFileDownloads) Module.dataFileDownloads = {};
 
+      var combined;
+      try {
+        combined = new Uint8Array(packageSize);
+      } catch (e) {
+        return errback(new Error('Not enough memory to hold game data (' + packageSize + ' bytes): ' + e));
+      }
       var chunksLoaded = 0;
-      var chunkBuffers = new Array(TOTAL_CHUNKS);
+      var failed = false;
       var chunkProgress = new Array(TOTAL_CHUNKS).fill(0);
-      var chunkTotals = new Array(TOTAL_CHUNKS).fill(0);
 
       function updateProgress() {
         var loaded = 0;
-        var total = 0;
-        for (var i = 0; i < TOTAL_CHUNKS; i++) {
-          loaded += chunkProgress[i];
-          total += chunkTotals[i] || (i < TOTAL_CHUNKS - 1 ? CHUNK_SIZE : (packageSize - CHUNK_SIZE * (TOTAL_CHUNKS - 1)));
-        }
-        Module.dataFileDownloads['game.data'] = { loaded: loaded, total: total };
+        for (var i = 0; i < TOTAL_CHUNKS; i++) loaded += chunkProgress[i];
+        Module.dataFileDownloads['game.data'] = { loaded: loaded, total: packageSize };
         if (Module['setStatus'])
           Module['setStatus'](
-            `Downloading data... ${asciiProgressBar(loaded, total, 50)} (${loaded}B/${total}B)`,
+            `Downloading data... ${asciiProgressBar(loaded, packageSize, 50)} (${loaded}B/${packageSize}B)`,
           );
       }
 
-      function onAllChunksLoaded() {
-        // Concatenate all chunks into a single ArrayBuffer
-        var totalSize = 0;
-        for (var i = 0; i < TOTAL_CHUNKS; i++) {
-          totalSize += chunkBuffers[i].byteLength;
-        }
-        var combined = new Uint8Array(totalSize);
-        var offset = 0;
-        for (var i = 0; i < TOTAL_CHUNKS; i++) {
-          combined.set(new Uint8Array(chunkBuffers[i]), offset);
-          offset += chunkBuffers[i].byteLength;
-        }
-        callback(combined.buffer);
+      function fail(error) {
+        if (failed) return;
+        failed = true;
+        errback(error);
       }
 
-      for (var c = 0; c < TOTAL_CHUNKS; c++) {
-        (function(chunkIndex) {
-          var chunkName = './data/game.data.' + String(chunkIndex).padStart(3, '0');
-          var xhr = new XMLHttpRequest();
-          xhr.open('GET', chunkName, true);
-          xhr.responseType = 'arraybuffer';
-          xhr.onprogress = function(event) {
-            if (event.total) chunkTotals[chunkIndex] = event.total;
-            if (event.loaded) {
-              chunkProgress[chunkIndex] = event.loaded;
-              updateProgress();
-            }
-          };
-          xhr.onerror = function(event) {
-            errback(new Error('NetworkError for chunk: ' + chunkName));
-          };
-          xhr.onload = function(event) {
-            if (
-              xhr.status == 200 ||
-              xhr.status == 304 ||
-              xhr.status == 206 ||
-              (xhr.status == 0 && xhr.response)
-            ) {
-              chunkBuffers[chunkIndex] = xhr.response;
-              chunkProgress[chunkIndex] = xhr.response.byteLength;
-              chunkTotals[chunkIndex] = xhr.response.byteLength;
-              chunksLoaded++;
-              updateProgress();
-              if (chunksLoaded === TOTAL_CHUNKS) {
-                onAllChunksLoaded();
-              }
-            } else {
-              errback(new Error(xhr.statusText + ' : ' + xhr.responseURL));
-            }
-          };
-          xhr.send(null);
-        })(c);
+      function loadChunk(chunkIndex, attempt) {
+        // The uuid query makes sure the browser HTTP cache never serves a chunk from an older build
+        var chunkName = './data/game.data.' + String(chunkIndex).padStart(3, '0') + '?v=' + PACKAGE_UUID;
+        var expected = chunkLength(chunkIndex, packageSize);
+        var xhr = new XMLHttpRequest();
+        xhr.open('GET', chunkName, true);
+        xhr.responseType = 'arraybuffer';
+
+        function retryOrFail(reason) {
+          if (failed) return;
+          chunkProgress[chunkIndex] = 0;
+          if (attempt < MAX_CHUNK_RETRIES) {
+            console.warn('Retrying ' + chunkName + ' (' + reason + ')');
+            setTimeout(function() { loadChunk(chunkIndex, attempt + 1); }, 1000 * attempt);
+          } else {
+            fail(new Error('Failed to download ' + chunkName + ': ' + reason));
+          }
+        }
+
+        xhr.onprogress = function(event) {
+          if (event.loaded) {
+            chunkProgress[chunkIndex] = event.loaded;
+            updateProgress();
+          }
+        };
+        xhr.onerror = function() { retryOrFail('network error'); };
+        xhr.ontimeout = function() { retryOrFail('timed out'); };
+        xhr.onload = function() {
+          if (failed) return;
+          var ok = xhr.status == 200 || xhr.status == 304 || xhr.status == 206 || (xhr.status == 0 && xhr.response);
+          if (!ok) return retryOrFail('HTTP ' + xhr.status + ' ' + xhr.statusText);
+          if (xhr.response.byteLength !== expected)
+            return retryOrFail('expected ' + expected + ' bytes, got ' + xhr.response.byteLength);
+          combined.set(new Uint8Array(xhr.response), CHUNK_SIZE * chunkIndex);
+          chunkProgress[chunkIndex] = expected;
+          chunksLoaded++;
+          updateProgress();
+          if (chunksLoaded === TOTAL_CHUNKS) callback(combined);
+        };
+        xhr.send(null);
       }
+
+      if (CHUNK_SIZE * (TOTAL_CHUNKS - 1) >= packageSize || CHUNK_SIZE * TOTAL_CHUNKS < packageSize)
+        return errback(new Error('game.js chunk layout does not match package size ' + packageSize));
+      for (var c = 0; c < TOTAL_CHUNKS; c++) loadChunk(c, 1);
     }
 
     function handleError(error) {
       console.error('package error:', error);
+      if (Module['setStatus']) Module['setStatus']('Failed to load game data: ' + error + ' (try the reset button in the corner)');
     }
 
     function runWithFS() {
@@ -197,7 +205,7 @@ Module.expectedDataFileDownloads++;
             true,
             true,
             true,
-          ); // canOwn this data in the filesystem, it is a slide into the heap that will never change
+          ); // canOwn: the file is a view into the package buffer, which is never modified
           Module['removeRunDependency']('fp ' + that.name);
 
           this.requests[this.name] = null;
@@ -222,15 +230,36 @@ Module.expectedDataFileDownloads++;
       var IDB_RO = 'readonly';
       var IDB_RW = 'readwrite';
       var DB_NAME = 'EM_PRELOAD_CACHE';
-      var DB_VERSION = 1;
+      var DB_VERSION = 2; // v2 stores the package as separate chunks; upgrading drops the old single-blob cache
       var METADATA_STORE_NAME = 'METADATA';
       var PACKAGE_STORE_NAME = 'PACKAGES';
 
+      // IndexedDB can hang without ever firing success/error (blocked upgrades, restricted profiles),
+      // so every cache step is raced against a timeout and only the first outcome counts.
+      function once(callback, errback, label, timeoutMs) {
+        var done = false;
+        var timer = setTimeout(function() {
+          if (done) return;
+          done = true;
+          errback(new Error('IndexedDB ' + label + ' timed out'));
+        }, timeoutMs);
+        function wrap(fn) {
+          return function(value) {
+            if (done) return;
+            done = true;
+            clearTimeout(timer);
+            fn(value);
+          };
+        }
+        return { ok: wrap(callback), fail: wrap(errback) };
+      }
+
       function openDatabase(callback, errback) {
+        var cb = once(callback, errback, 'open', 10000);
         try {
           var openRequest = indexedDB.open(DB_NAME, DB_VERSION);
         } catch (e) {
-          return errback(e);
+          return cb.fail(e);
         }
         openRequest.onupgradeneeded = function(event) {
           var db = event.target.result;
@@ -238,114 +267,122 @@ Module.expectedDataFileDownloads++;
           if (db.objectStoreNames.contains(PACKAGE_STORE_NAME)) {
             db.deleteObjectStore(PACKAGE_STORE_NAME);
           }
-          var packages = db.createObjectStore(PACKAGE_STORE_NAME);
+          db.createObjectStore(PACKAGE_STORE_NAME);
 
           if (db.objectStoreNames.contains(METADATA_STORE_NAME)) {
             db.deleteObjectStore(METADATA_STORE_NAME);
           }
-          var metadata = db.createObjectStore(METADATA_STORE_NAME);
+          db.createObjectStore(METADATA_STORE_NAME);
         };
         openRequest.onsuccess = function(event) {
           var db = event.target.result;
-          callback(db);
+          // Let other tabs (or the reset button) delete/upgrade the database instead of being blocked by us
+          db.onversionchange = function() { db.close(); };
+          cb.ok(db);
         };
-        openRequest.onerror = function(error) {
-          errback(error);
+        openRequest.onerror = function(event) {
+          cb.fail(openRequest.error || event);
+        };
+        openRequest.onblocked = function() {
+          cb.fail(new Error('IndexedDB open blocked by another tab'));
         };
       }
 
-      /* Check if there's a cached package, and if so whether it's the latest available */
-      function checkCachedPackage(db, packageName, callback, errback) {
-        var transaction = db.transaction([METADATA_STORE_NAME], IDB_RO);
-        var metadata = transaction.objectStore(METADATA_STORE_NAME);
+      /* Loads the cached package if it exists, is complete and matches this build; otherwise calls callback(null) */
+      function fetchCachedPackage(db, packageName, callback, errback) {
+        var cb = once(callback, errback, 'read', 60000); // reading ~140MB can be slow on weak devices
+        try {
+          var transaction = db.transaction([METADATA_STORE_NAME, PACKAGE_STORE_NAME], IDB_RO);
+        } catch (e) {
+          return cb.fail(e);
+        }
+        transaction.onabort = function() { cb.fail(transaction.error || new Error('cache read aborted')); };
 
-        var getRequest = metadata.get('metadata/' + packageName);
-        getRequest.onsuccess = function(event) {
-          var result = event.target.result;
-          if (!result) {
-            return callback(false);
-          } else {
-            return callback(PACKAGE_UUID === result.uuid);
+        var metaRequest = transaction.objectStore(METADATA_STORE_NAME).get('metadata/' + packageName);
+        metaRequest.onerror = function() { cb.fail(metaRequest.error); };
+        metaRequest.onsuccess = function() {
+          var meta = metaRequest.result;
+          if (!meta || meta.uuid !== PACKAGE_UUID || meta.chunks !== TOTAL_CHUNKS) return cb.ok(null);
+
+          var packages = transaction.objectStore(PACKAGE_STORE_NAME);
+          var combined;
+          try {
+            combined = new Uint8Array(REMOTE_PACKAGE_SIZE);
+          } catch (e) {
+            return cb.fail(e);
+          }
+          var remaining = TOTAL_CHUNKS;
+          var missing = false;
+          for (var c = 0; c < TOTAL_CHUNKS; c++) {
+            (function(chunkIndex) {
+              var getRequest = packages.get('package/' + packageName + '/' + chunkIndex);
+              getRequest.onerror = function() { cb.fail(getRequest.error); };
+              getRequest.onsuccess = function() {
+                var value = getRequest.result;
+                if (value instanceof ArrayBuffer) value = new Uint8Array(value);
+                if (!value || value.byteLength !== chunkLength(chunkIndex, REMOTE_PACKAGE_SIZE)) {
+                  missing = true;
+                } else {
+                  combined.set(value, CHUNK_SIZE * chunkIndex);
+                }
+                if (--remaining === 0) cb.ok(missing ? null : combined);
+              };
+            })(c);
           }
         };
-        getRequest.onerror = function(error) {
-          errback(error);
-        };
       }
 
-      function fetchCachedPackage(db, packageName, callback, errback) {
-        var transaction = db.transaction([PACKAGE_STORE_NAME], IDB_RO);
-        var packages = transaction.objectStore(PACKAGE_STORE_NAME);
-
-        var getRequest = packages.get('package/' + packageName);
-        getRequest.onsuccess = function(event) {
-          var result = event.target.result;
-          callback(result);
-        };
-        getRequest.onerror = function(error) {
-          errback(error);
-        };
-      }
-
-      function cacheRemotePackage(
-        db,
-        packageName,
-        packageData,
-        packageMeta,
-        callback,
-        errback,
-      ) {
-        var transaction_packages = db.transaction([PACKAGE_STORE_NAME], IDB_RW);
-        var packages = transaction_packages.objectStore(PACKAGE_STORE_NAME);
-
-        var putPackageRequest = packages.put(
-          packageData,
-          'package/' + packageName,
-        );
-        putPackageRequest.onsuccess = function(event) {
-          var transaction_metadata = db.transaction(
-            [METADATA_STORE_NAME],
-            IDB_RW,
+      /* Writes the package one chunk per transaction (small writes are far more reliable than one huge one), metadata last */
+      function cacheRemotePackage(db, packageName, byteArray) {
+        function writeChunk(chunkIndex) {
+          if (chunkIndex === TOTAL_CHUNKS) {
+            var metaTx = db.transaction([METADATA_STORE_NAME], IDB_RW);
+            metaTx.objectStore(METADATA_STORE_NAME).put({ uuid: PACKAGE_UUID, chunks: TOTAL_CHUNKS }, 'metadata/' + packageName);
+            metaTx.oncomplete = function() { console.info('cached ' + PACKAGE_NAME + ' in IndexedDB'); };
+            metaTx.onabort = function() { console.warn('could not cache ' + PACKAGE_NAME + ':', metaTx.error); };
+            return;
+          }
+          var start = CHUNK_SIZE * chunkIndex;
+          var tx = db.transaction([PACKAGE_STORE_NAME], IDB_RW);
+          // slice() copies just this chunk; cloning a subarray would serialize the whole package buffer
+          tx.objectStore(PACKAGE_STORE_NAME).put(
+            byteArray.slice(start, start + chunkLength(chunkIndex, REMOTE_PACKAGE_SIZE)),
+            'package/' + packageName + '/' + chunkIndex,
           );
-          var metadata = transaction_metadata.objectStore(METADATA_STORE_NAME);
-          var putMetadataRequest = metadata.put(
-            packageMeta,
-            'metadata/' + packageName,
-          );
-          putMetadataRequest.onsuccess = function(event) {
-            callback(packageData);
-          };
-          putMetadataRequest.onerror = function(error) {
-            errback(error);
-          };
-        };
-        putPackageRequest.onerror = function(error) {
-          errback(error);
-        };
+          tx.oncomplete = function() { writeChunk(chunkIndex + 1); };
+          tx.onabort = function() { console.warn('could not cache ' + PACKAGE_NAME + ' (chunk ' + chunkIndex + '):', tx.error); };
+        }
+
+        try {
+          // Invalidate first so a half-written cache is never mistaken for a complete one
+          var clearTx = db.transaction([METADATA_STORE_NAME], IDB_RW);
+          clearTx.objectStore(METADATA_STORE_NAME).delete('metadata/' + packageName);
+          clearTx.oncomplete = function() { writeChunk(0); };
+          clearTx.onabort = function() { console.warn('could not cache ' + PACKAGE_NAME + ':', clearTx.error); };
+        } catch (e) {
+          console.warn('could not cache ' + PACKAGE_NAME + ':', e);
+        }
       }
 
-      function processPackageData(arrayBuffer) {
+      var packageProcessed = false;
+      function processPackageData(byteArray) {
+        if (packageProcessed) return;
+        packageProcessed = true;
+        try {
+          installPackage(byteArray);
+        } catch (e) {
+          handleError(e);
+        }
+      }
+
+      function installPackage(byteArray) {
         Module.finishedDataFileDownloads++;
-        assert(arrayBuffer, 'Loading data file failed.');
-        assert(
-          arrayBuffer instanceof ArrayBuffer,
-          'bad input to processPackageData',
-        );
-        var byteArray = new Uint8Array(arrayBuffer);
-        var curr;
+        assert(byteArray instanceof Uint8Array, 'bad input to processPackageData');
+        assert(byteArray.length === REMOTE_PACKAGE_SIZE, 'Loading data file failed: wrong size');
 
-        // copy the entire loaded file into a spot in the heap. Files will refer to slices in that. They cannot be freed though
-        // (we may be allocating before malloc is ready, during startup).
-        if (Module['SPLIT_MEMORY'])
-          Module.printErr(
-            'warning: you should run the file packager with --no-heap-copy when SPLIT_MEMORY is used, otherwise copying into the heap may fail due to the splitting',
-          );
-        var ptr = Module['getMemory'](byteArray.length);
-        Module['HEAPU8'].set(byteArray, ptr);
-        DataRequest.prototype.byteArray = Module['HEAPU8'].subarray(
-          ptr,
-          ptr + byteArray.length,
-        );
+        // Files are views into this JS buffer rather than a copy in the wasm heap (emscripten's --no-heap-copy).
+        // Besides saving ~140MB of heap, heap views would be detached (files read back empty) whenever the heap grows.
+        DataRequest.prototype.byteArray = byteArray;
 
         var files = metadata.files;
         for (i = 0; i < files.length; ++i) {
@@ -357,63 +394,41 @@ Module.expectedDataFileDownloads++;
 
       if (!Module.preloadResults) Module.preloadResults = {};
 
-      function preloadFallback(error) {
-        console.error(error);
-        console.error('falling back to default preload behavior');
+      function loadRemote(db) {
+        console.info('loading ' + PACKAGE_NAME + ' from remote');
         fetchRemotePackage(
           PACKAGE_NAME,
           REMOTE_PACKAGE_SIZE,
-          processPackageData,
+          function(byteArray) {
+            processPackageData(byteArray);
+            // Cache in the background; the game does not wait for (or depend on) this succeeding
+            if (db && !DEBUG_MODE) cacheRemotePackage(db, PACKAGE_PATH + PACKAGE_NAME, byteArray);
+          },
           handleError,
         );
       }
 
+      function preloadFallback(error) {
+        console.error(error);
+        console.error('falling back to default preload behavior');
+        loadRemote(null);
+      }
+
       openDatabase(function(db) {
-        checkCachedPackage(
+        if (DEBUG_MODE) return loadRemote(db); // disabled cached stuff when in debug mode
+        fetchCachedPackage(
           db,
           PACKAGE_PATH + PACKAGE_NAME,
-          function(useCached) {
-            Module.preloadResults[PACKAGE_NAME] = {
-              fromCache: useCached
-            };
-            if (
-              useCached &&
-              !DEBUG_MODE &&
-              localStorage.getItem('packageUuid') === PACKAGE_UUID // fix for when game.data is updated, it will force the user to redownload the new package instead of using the cached one
-            ) {
-              // disabled cached stuff when in debug mode
-              console.info('loading ' + PACKAGE_NAME + ' from cache');
-              fetchCachedPackage(
-                db,
-                PACKAGE_PATH + PACKAGE_NAME,
-                processPackageData,
-                preloadFallback,
-              );
-            } else {
-              console.info('loading ' + PACKAGE_NAME + ' from remote');
-              localStorage.setItem('packageUuid', PACKAGE_UUID);
-              fetchRemotePackage(
-                PACKAGE_NAME,
-                REMOTE_PACKAGE_SIZE,
-                function(packageData) {
-                  cacheRemotePackage(
-                    db,
-                    PACKAGE_PATH + PACKAGE_NAME,
-                    packageData, {
-                      uuid: PACKAGE_UUID
-                    },
-                    processPackageData,
-                    function(error) {
-                      console.error(error);
-                      processPackageData(packageData);
-                    },
-                  );
-                },
-                preloadFallback,
-              );
-            }
+          function(byteArray) {
+            Module.preloadResults[PACKAGE_NAME] = { fromCache: !!byteArray };
+            if (!byteArray) return loadRemote(db);
+            console.info('loading ' + PACKAGE_NAME + ' from cache');
+            processPackageData(byteArray);
           },
-          preloadFallback,
+          function(error) {
+            console.error(error);
+            loadRemote(db);
+          },
         );
       }, preloadFallback);
 
@@ -428,8 +443,8 @@ Module.expectedDataFileDownloads++;
   };
   // ignore placeholder (and error) its needed so that it doesnt crash after updating the lua code (gets replaced by setup_loadPackage.py in build.sh)
   loadPackage({
-    "package_uuid": "83962291-3af7-4a06-8231-0d135e004e77",
-    "remote_package_size": 139608945,
+    "package_uuid": "5555b386-07b4-4982-8aee-929677e113d0",
+    "remote_package_size": 111313256,
     "files": [
         {
             "filename": "/back.lua",
@@ -771,11739 +786,13846 @@ Module.expectedDataFileDownloads++;
             "filename": "/lovely_patches.lua",
             "crunched": 0,
             "start": 3912120,
-            "end": 4880171,
+            "end": 5556973,
             "audio": false
         },
         {
             "filename": "/lovely.lua",
             "crunched": 0,
-            "start": 4880171,
-            "end": 4911944,
+            "start": 5556973,
+            "end": 5589152,
             "audio": false
         },
         {
             "filename": "/main.lua",
             "crunched": 0,
-            "start": 4911944,
-            "end": 4912017,
+            "start": 5589152,
+            "end": 5589225,
             "audio": false
         },
         {
             "filename": "/manifest.json",
             "crunched": 0,
-            "start": 4912017,
-            "end": 4990391,
+            "start": 5589225,
+            "end": 5683578,
             "audio": false
         },
         {
             "filename": "/Mods/Amulet/assets/1x/icon.png",
             "crunched": 0,
-            "start": 4990391,
-            "end": 4991237,
+            "start": 5683578,
+            "end": 5684424,
             "audio": false
         },
         {
             "filename": "/Mods/Amulet/assets/2x/icon.png",
             "crunched": 0,
-            "start": 4991237,
-            "end": 4992270,
+            "start": 5684424,
+            "end": 5685457,
             "audio": false
         },
         {
             "filename": "/Mods/Amulet/assets/sounds/blindsize/e.ogg",
             "crunched": 0,
-            "start": 4992270,
-            "end": 5090224,
+            "start": 5685457,
+            "end": 5783411,
             "audio": false
         },
         {
             "filename": "/Mods/Amulet/assets/sounds/blindsize/ee.ogg",
             "crunched": 0,
-            "start": 5090224,
-            "end": 5236620,
+            "start": 5783411,
+            "end": 5929807,
             "audio": false
         },
         {
             "filename": "/Mods/Amulet/assets/sounds/blindsize/eee.ogg",
             "crunched": 0,
-            "start": 5236620,
-            "end": 5431470,
+            "start": 5929807,
+            "end": 6124657,
             "audio": false
         },
         {
             "filename": "/Mods/Amulet/assets/sounds/chips/e.ogg",
             "crunched": 0,
-            "start": 5431470,
-            "end": 5473219,
+            "start": 6124657,
+            "end": 6166406,
             "audio": false
         },
         {
             "filename": "/Mods/Amulet/assets/sounds/chips/ee.ogg",
             "crunched": 0,
-            "start": 5473219,
-            "end": 5559520,
+            "start": 6166406,
+            "end": 6252707,
             "audio": false
         },
         {
             "filename": "/Mods/Amulet/assets/sounds/chips/eee.ogg",
             "crunched": 0,
-            "start": 5559520,
-            "end": 5726391,
+            "start": 6252707,
+            "end": 6419578,
             "audio": false
         },
         {
             "filename": "/Mods/Amulet/assets/sounds/chips/x.ogg",
             "crunched": 0,
-            "start": 5726391,
-            "end": 5751419,
+            "start": 6419578,
+            "end": 6444606,
             "audio": false
         },
         {
             "filename": "/Mods/Amulet/assets/sounds/mult/e.ogg",
             "crunched": 0,
-            "start": 5751419,
-            "end": 5794827,
+            "start": 6444606,
+            "end": 6488014,
             "audio": false
         },
         {
             "filename": "/Mods/Amulet/assets/sounds/mult/ee.ogg",
             "crunched": 0,
-            "start": 5794827,
-            "end": 5838345,
+            "start": 6488014,
+            "end": 6531532,
             "audio": false
         },
         {
             "filename": "/Mods/Amulet/assets/sounds/mult/eee.ogg",
             "crunched": 0,
-            "start": 5838345,
-            "end": 5904566,
+            "start": 6531532,
+            "end": 6597753,
             "audio": false
         },
         {
             "filename": "/Mods/Amulet/big-num/constants.lua",
             "crunched": 0,
-            "start": 5904566,
-            "end": 5905389,
+            "start": 6597753,
+            "end": 6598576,
             "audio": false
         },
         {
             "filename": "/Mods/Amulet/big-num/notations.lua",
             "crunched": 0,
-            "start": 5905389,
-            "end": 5905544,
+            "start": 6598576,
+            "end": 6598731,
             "audio": false
         },
         {
             "filename": "/Mods/Amulet/big-num/notations/arraynotation.lua",
             "crunched": 0,
-            "start": 5905544,
-            "end": 5906824,
+            "start": 6598731,
+            "end": 6600011,
             "audio": false
         },
         {
             "filename": "/Mods/Amulet/big-num/notations/Balatro.lua",
             "crunched": 0,
-            "start": 5906824,
-            "end": 5910085,
+            "start": 6600011,
+            "end": 6603272,
             "audio": false
         },
         {
             "filename": "/Mods/Amulet/big-num/notations/notation.lua",
             "crunched": 0,
-            "start": 5910085,
-            "end": 5911154,
+            "start": 6603272,
+            "end": 6604341,
             "audio": false
         },
         {
             "filename": "/Mods/Amulet/big-num/omeganum.lua",
             "crunched": 0,
-            "start": 5911154,
-            "end": 5951565,
+            "start": 6604341,
+            "end": 6644752,
             "audio": false
         },
         {
             "filename": "/Mods/Amulet/icon.png",
             "crunched": 0,
-            "start": 5951565,
-            "end": 5953909,
+            "start": 6644752,
+            "end": 6647096,
             "audio": false
         },
         {
             "filename": "/Mods/Amulet/LICENSE",
             "crunched": 0,
-            "start": 5953909,
-            "end": 5989058,
+            "start": 6647096,
+            "end": 6682245,
             "audio": false
         },
         {
             "filename": "/Mods/Amulet/lovely.toml",
             "crunched": 0,
-            "start": 5989058,
-            "end": 5991234,
+            "start": 6682245,
+            "end": 6684421,
             "audio": false
         },
         {
             "filename": "/Mods/Amulet/lovely/anims.toml",
             "crunched": 0,
-            "start": 5991234,
-            "end": 5992864,
+            "start": 6684421,
+            "end": 6686051,
             "audio": false
         },
         {
             "filename": "/Mods/Amulet/lovely/card.toml",
             "crunched": 0,
-            "start": 5992864,
-            "end": 5993932,
+            "start": 6686051,
+            "end": 6687119,
             "audio": false
         },
         {
             "filename": "/Mods/Amulet/lovely/fixes.toml",
             "crunched": 0,
-            "start": 5993932,
-            "end": 6001914,
+            "start": 6687119,
+            "end": 6695101,
             "audio": false
         },
         {
             "filename": "/Mods/Amulet/lovely/gradients.toml",
             "crunched": 0,
-            "start": 6001914,
-            "end": 6002282,
+            "start": 6695101,
+            "end": 6695469,
             "audio": false
         },
         {
             "filename": "/Mods/Amulet/lovely/noanims.toml",
             "crunched": 0,
-            "start": 6002282,
-            "end": 6006014,
+            "start": 6695469,
+            "end": 6699201,
             "audio": false
         },
         {
             "filename": "/Mods/Amulet/lovely/numfmt.toml",
             "crunched": 0,
-            "start": 6006014,
-            "end": 6008803,
+            "start": 6699201,
+            "end": 6701990,
             "audio": false
         },
         {
             "filename": "/Mods/Amulet/lovely/save.toml",
             "crunched": 0,
-            "start": 6008803,
-            "end": 6011344,
+            "start": 6701990,
+            "end": 6704531,
             "audio": false
         },
         {
             "filename": "/Mods/Amulet/lovely/scoring.toml",
             "crunched": 0,
-            "start": 6011344,
-            "end": 6015029,
+            "start": 6704531,
+            "end": 6708216,
             "audio": false
         },
         {
             "filename": "/Mods/Amulet/lovely/talisman-detection-after.toml",
             "crunched": 0,
-            "start": 6015029,
-            "end": 6015901,
+            "start": 6708216,
+            "end": 6709088,
             "audio": false
         },
         {
             "filename": "/Mods/Amulet/lovely/talisman-detection.toml",
             "crunched": 0,
-            "start": 6015901,
-            "end": 6016181,
+            "start": 6709088,
+            "end": 6709368,
             "audio": false
         },
         {
             "filename": "/Mods/Amulet/lovely/typefix.toml",
             "crunched": 0,
-            "start": 6016181,
-            "end": 6018522,
+            "start": 6709368,
+            "end": 6711709,
             "audio": false
         },
         {
             "filename": "/Mods/Amulet/lovely/valid.toml",
             "crunched": 0,
-            "start": 6018522,
-            "end": 6018717,
+            "start": 6711709,
+            "end": 6711904,
             "audio": false
         },
         {
             "filename": "/Mods/Amulet/lovely/valid.txt",
             "crunched": 0,
-            "start": 6018717,
-            "end": 6018743,
+            "start": 6711904,
+            "end": 6711930,
             "audio": false
         },
         {
             "filename": "/Mods/Amulet/manifest.json",
             "crunched": 0,
-            "start": 6018743,
-            "end": 6018999,
+            "start": 6711930,
+            "end": 6712186,
             "audio": false
         },
         {
             "filename": "/Mods/Amulet/README.md",
             "crunched": 0,
-            "start": 6018999,
-            "end": 6020878,
+            "start": 6712186,
+            "end": 6714065,
             "audio": false
         },
         {
             "filename": "/Mods/Amulet/smods.json",
             "crunched": 0,
-            "start": 6020878,
-            "end": 6021335,
+            "start": 6714065,
+            "end": 6714522,
             "audio": false
         },
         {
             "filename": "/Mods/Amulet/smods.lua",
             "crunched": 0,
-            "start": 6021335,
-            "end": 6025069,
+            "start": 6714522,
+            "end": 6718256,
             "audio": false
         },
         {
             "filename": "/Mods/Amulet/talisman.lua",
             "crunched": 0,
-            "start": 6025069,
-            "end": 6026009,
+            "start": 6718256,
+            "end": 6719196,
             "audio": false
         },
         {
             "filename": "/Mods/Amulet/talisman/break_inf.lua",
             "crunched": 0,
-            "start": 6026009,
-            "end": 6032851,
+            "start": 6719196,
+            "end": 6726038,
             "audio": false
         },
         {
             "filename": "/Mods/Amulet/talisman/break_inf/globals.lua",
             "crunched": 0,
-            "start": 6032851,
-            "end": 6033517,
+            "start": 6726038,
+            "end": 6726704,
             "audio": false
         },
         {
             "filename": "/Mods/Amulet/talisman/break_inf/math.lua",
             "crunched": 0,
-            "start": 6033517,
-            "end": 6035305,
+            "start": 6726704,
+            "end": 6728492,
             "audio": false
         },
         {
             "filename": "/Mods/Amulet/talisman/break_inf/sanitizer.lua",
             "crunched": 0,
-            "start": 6035305,
-            "end": 6037620,
+            "start": 6728492,
+            "end": 6730807,
             "audio": false
         },
         {
             "filename": "/Mods/Amulet/talisman/configinit.lua",
             "crunched": 0,
-            "start": 6037620,
-            "end": 6040393,
+            "start": 6730807,
+            "end": 6733580,
             "audio": false
         },
         {
             "filename": "/Mods/Amulet/talisman/configtab.lua",
             "crunched": 0,
-            "start": 6040393,
-            "end": 6048765,
+            "start": 6733580,
+            "end": 6741952,
             "audio": false
         },
         {
             "filename": "/Mods/Amulet/talisman/coroutine.lua",
             "crunched": 0,
-            "start": 6048765,
-            "end": 6056198,
+            "start": 6741952,
+            "end": 6750703,
             "audio": false
         },
         {
             "filename": "/Mods/Amulet/talisman/debug.lua",
             "crunched": 0,
-            "start": 6056198,
-            "end": 6056750,
+            "start": 6750703,
+            "end": 6751255,
             "audio": false
         },
         {
             "filename": "/Mods/Amulet/talisman/effects.lua",
             "crunched": 0,
-            "start": 6056750,
-            "end": 6066768,
+            "start": 6751255,
+            "end": 6761273,
             "audio": false
         },
         {
             "filename": "/Mods/Amulet/talisman/globals.lua",
             "crunched": 0,
-            "start": 6066768,
-            "end": 6068296,
+            "start": 6761273,
+            "end": 6762801,
             "audio": false
         },
         {
             "filename": "/Mods/Amulet/talisman/gradients.lua",
             "crunched": 0,
-            "start": 6068296,
-            "end": 6070674,
+            "start": 6762801,
+            "end": 6765179,
             "audio": false
         },
         {
             "filename": "/Mods/Amulet/talisman/localization.lua",
             "crunched": 0,
-            "start": 6070674,
-            "end": 6071507,
+            "start": 6765179,
+            "end": 6766012,
             "audio": false
         },
         {
             "filename": "/Mods/Amulet/talisman/localization/en-us.lua",
             "crunched": 0,
-            "start": 6071507,
-            "end": 6074040,
+            "start": 6766012,
+            "end": 6768545,
             "audio": false
         },
         {
             "filename": "/Mods/Amulet/talisman/localization/vi.lua",
             "crunched": 0,
-            "start": 6074040,
-            "end": 6076900,
+            "start": 6768545,
+            "end": 6771405,
             "audio": false
         },
         {
             "filename": "/Mods/Amulet/talisman/localization/zh_CN.lua",
             "crunched": 0,
-            "start": 6076900,
-            "end": 6079503,
+            "start": 6771405,
+            "end": 6774008,
             "audio": false
         },
         {
             "filename": "/Mods/Amulet/talisman/noanims.lua",
             "crunched": 0,
-            "start": 6079503,
-            "end": 6083260,
+            "start": 6774008,
+            "end": 6777765,
             "audio": false
         },
         {
             "filename": "/Mods/Amulet/talisman/sanitizer.lua",
             "crunched": 0,
-            "start": 6083260,
-            "end": 6085436,
+            "start": 6777765,
+            "end": 6779941,
             "audio": false
         },
         {
             "filename": "/Mods/Amulet/talisman/smods/gradients.lua",
             "crunched": 0,
-            "start": 6085436,
-            "end": 6086001,
+            "start": 6779941,
+            "end": 6780506,
             "audio": false
         },
         {
             "filename": "/Mods/Amulet/talisman/smods/ind_effect.lua",
             "crunched": 0,
-            "start": 6086001,
-            "end": 6088151,
+            "start": 6780506,
+            "end": 6782656,
             "audio": false
         },
         {
             "filename": "/Mods/Amulet/talisman/smods/scoring_calc.lua",
             "crunched": 0,
-            "start": 6088151,
-            "end": 6089775,
+            "start": 6782656,
+            "end": 6784280,
             "audio": false
         },
         {
             "filename": "/Mods/Amulet/talisman/smods/test.lua",
             "crunched": 0,
-            "start": 6089775,
-            "end": 6091015,
+            "start": 6784280,
+            "end": 6785520,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/Aurinko/Aurinko.lua",
+            "crunched": 0,
+            "start": 6785520,
+            "end": 6811485,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/Aurinko/LICENSE",
+            "crunched": 0,
+            "start": 6811485,
+            "end": 6847308,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/Cartomancer/assets/1x/modicon.png",
+            "crunched": 0,
+            "start": 6847308,
+            "end": 6847769,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/Cartomancer/assets/1x/settings.png",
+            "crunched": 0,
+            "start": 6847769,
+            "end": 6848295,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/Cartomancer/assets/2x/modicon.png",
+            "crunched": 0,
+            "start": 6848295,
+            "end": 6848769,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/Cartomancer/assets/2x/settings.png",
+            "crunched": 0,
+            "start": 6848769,
+            "end": 6849111,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/Cartomancer/cartomancer.lua",
+            "crunched": 0,
+            "start": 6849111,
+            "end": 6851653,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/Cartomancer/config.lua",
+            "crunched": 0,
+            "start": 6851653,
+            "end": 6853562,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/Cartomancer/core/blinds_info.lua",
+            "crunched": 0,
+            "start": 6853562,
+            "end": 6862367,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/Cartomancer/core/flames.lua",
+            "crunched": 0,
+            "start": 6862367,
+            "end": 6864081,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/Cartomancer/core/hand.lua",
+            "crunched": 0,
+            "start": 6864081,
+            "end": 6865795,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/Cartomancer/core/jokers.lua",
+            "crunched": 0,
+            "start": 6865795,
+            "end": 6874909,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/Cartomancer/core/optimizations.lua",
+            "crunched": 0,
+            "start": 6874909,
+            "end": 6875518,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/Cartomancer/core/view-deck-steamodded.lua",
+            "crunched": 0,
+            "start": 6875518,
+            "end": 6876544,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/Cartomancer/core/view-deck.lua",
+            "crunched": 0,
+            "start": 6876544,
+            "end": 6884765,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/Cartomancer/git-assets/blinds-info.jpg",
+            "crunched": 0,
+            "start": 6884765,
+            "end": 7249490,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/Cartomancer/git-assets/deck-pile.jpg",
+            "crunched": 0,
+            "start": 7249490,
+            "end": 7358732,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/Cartomancer/git-assets/stackable-cards.jpg",
+            "crunched": 0,
+            "start": 7358732,
+            "end": 8438873,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/Cartomancer/git-assets/zoom-jokers.jpg",
+            "crunched": 0,
+            "start": 8438873,
+            "end": 8947286,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/Cartomancer/internal/atlas.lua",
+            "crunched": 0,
+            "start": 8947286,
+            "end": 8948441,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/Cartomancer/internal/config.lua",
+            "crunched": 0,
+            "start": 8948441,
+            "end": 8951325,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/Cartomancer/internal/init.lua",
+            "crunched": 0,
+            "start": 8951325,
+            "end": 8956295,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/Cartomancer/internal/keybinds.lua",
+            "crunched": 0,
+            "start": 8956295,
+            "end": 8960450,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/Cartomancer/internal/localization.lua",
+            "crunched": 0,
+            "start": 8960450,
+            "end": 8962128,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/Cartomancer/internal/ui.lua",
+            "crunched": 0,
+            "start": 8962128,
+            "end": 8991738,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/Cartomancer/libs/nativefs.lua",
+            "crunched": 0,
+            "start": 8991738,
+            "end": 9006559,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/Cartomancer/LICENSE",
+            "crunched": 0,
+            "start": 9006559,
+            "end": 9041707,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/Cartomancer/localization/en-us.lua",
+            "crunched": 0,
+            "start": 9041707,
+            "end": 9044921,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/Cartomancer/localization/es_ES.lua",
+            "crunched": 0,
+            "start": 9044921,
+            "end": 9047674,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/Cartomancer/localization/ja.lua",
+            "crunched": 0,
+            "start": 9047674,
+            "end": 9051489,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/Cartomancer/localization/vi.lua",
+            "crunched": 0,
+            "start": 9051489,
+            "end": 9054943,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/Cartomancer/localization/zh_CN.lua",
+            "crunched": 0,
+            "start": 9054943,
+            "end": 9058310,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/Cartomancer/lovely.toml",
+            "crunched": 0,
+            "start": 9058310,
+            "end": 9058708,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/Cartomancer/lovely/blinds-info.toml",
+            "crunched": 0,
+            "start": 9058708,
+            "end": 9060108,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/Cartomancer/lovely/dynamic-ante-display.disabled",
+            "crunched": 0,
+            "start": 9060108,
+            "end": 9061964,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/Cartomancer/lovely/dynamic-hand-align.toml",
+            "crunched": 0,
+            "start": 9061964,
+            "end": 9062621,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/Cartomancer/lovely/fixed-flames.toml",
+            "crunched": 0,
+            "start": 9062621,
+            "end": 9063969,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/Cartomancer/lovely/fixes.toml",
+            "crunched": 0,
+            "start": 9063969,
+            "end": 9064561,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/Cartomancer/lovely/hand-sorting.toml",
+            "crunched": 0,
+            "start": 9064561,
+            "end": 9065504,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/Cartomancer/lovely/hidden-jokers.toml",
+            "crunched": 0,
+            "start": 9065504,
+            "end": 9066042,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/Cartomancer/lovely/keybinds.toml",
+            "crunched": 0,
+            "start": 9066042,
+            "end": 9066493,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/Cartomancer/lovely/limit-deck-size.toml",
+            "crunched": 0,
+            "start": 9066493,
+            "end": 9070251,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/Cartomancer/lovely/saturn-compat.toml",
+            "crunched": 0,
+            "start": 9070251,
+            "end": 9070631,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/Cartomancer/lovely/stackable-deck-steamodded-0.9.8.toml",
+            "crunched": 0,
+            "start": 9070631,
+            "end": 9070951,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/Cartomancer/lovely/stackable-deck-steamodded.toml",
+            "crunched": 0,
+            "start": 9070951,
+            "end": 9076488,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/Cartomancer/lovely/stackable-deck-vanilla.toml",
+            "crunched": 0,
+            "start": 9076488,
+            "end": 9080784,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/Cartomancer/lovely/tags.toml",
+            "crunched": 0,
+            "start": 9080784,
+            "end": 9081063,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/Cartomancer/lovely/vanilla-ui.toml",
+            "crunched": 0,
+            "start": 9081063,
+            "end": 9083818,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/Cartomancer/lovely/zoom-jokers.toml",
+            "crunched": 0,
+            "start": 9083818,
+            "end": 9085880,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/Cartomancer/mod.lua",
+            "crunched": 0,
+            "start": 9085880,
+            "end": 9086502,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/Cartomancer/README.md",
+            "crunched": 0,
+            "start": 9086502,
+            "end": 9088206,
             "audio": false
         },
         {
             "filename": "/Mods/config/Multiplayer.jkr",
             "crunched": 0,
-            "start": 6091015,
-            "end": 6091430,
+            "start": 9088206,
+            "end": 9088621,
             "audio": false
         },
         {
             "filename": "/Mods/config/Steamodded.jkr",
             "crunched": 0,
-            "start": 6091430,
-            "end": 6091615,
+            "start": 9088621,
+            "end": 9088806,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/.gitattributes",
             "crunched": 0,
-            "start": 6091615,
-            "end": 6091681,
+            "start": 9088806,
+            "end": 9088872,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/.gitignore",
             "crunched": 0,
-            "start": 6091681,
-            "end": 6091804,
+            "start": 9088872,
+            "end": 9088995,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/assets/1x/atlasdeck.png",
             "crunched": 0,
-            "start": 6091804,
-            "end": 6283455,
+            "start": 9088995,
+            "end": 9280646,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/assets/1x/atlaseditiondeck.png",
             "crunched": 0,
-            "start": 6283455,
-            "end": 6339440,
+            "start": 9280646,
+            "end": 9336631,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/assets/1x/atlasepic.png",
             "crunched": 0,
-            "start": 6339440,
-            "end": 6453177,
+            "start": 9336631,
+            "end": 9450368,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/assets/1x/atlasexotic.png",
             "crunched": 0,
-            "start": 6453177,
-            "end": 6645822,
+            "start": 9450368,
+            "end": 9643013,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/assets/1x/atlasnotjokers.png",
             "crunched": 0,
-            "start": 6645822,
-            "end": 6821338,
+            "start": 9643013,
+            "end": 9818529,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/assets/1x/atlasone.png",
             "crunched": 0,
-            "start": 6821338,
-            "end": 6953925,
+            "start": 9818529,
+            "end": 9951116,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/assets/1x/atlasSleeves.png",
             "crunched": 0,
-            "start": 6953925,
-            "end": 6992016,
+            "start": 9951116,
+            "end": 9989207,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/assets/1x/atlasspooky.png",
             "crunched": 0,
-            "start": 6992016,
-            "end": 7063640,
+            "start": 9989207,
+            "end": 10060831,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/assets/1x/atlasthree.png",
             "crunched": 0,
-            "start": 7063640,
-            "end": 7303152,
+            "start": 10060831,
+            "end": 10300343,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/assets/1x/atlastwo.png",
             "crunched": 0,
-            "start": 7303152,
-            "end": 7451675,
+            "start": 10300343,
+            "end": 10448866,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/assets/1x/atlasvoucher.png",
             "crunched": 0,
-            "start": 7451675,
-            "end": 7580602,
+            "start": 10448866,
+            "end": 10577793,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/assets/1x/b_cry_glowing.png",
             "crunched": 0,
-            "start": 7580602,
-            "end": 7623645,
+            "start": 10577793,
+            "end": 10620836,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/assets/1x/bl_cry_two.png",
             "crunched": 0,
-            "start": 7623645,
-            "end": 7630905,
+            "start": 10620836,
+            "end": 10628096,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/assets/1x/bl_cry.png",
             "crunched": 0,
-            "start": 7630905,
-            "end": 7660549,
+            "start": 10628096,
+            "end": 10657740,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/assets/1x/bl_nostalgia.png",
             "crunched": 0,
-            "start": 7660549,
-            "end": 7687660,
+            "start": 10657740,
+            "end": 10684851,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/assets/1x/cry_achievements.png",
             "crunched": 0,
-            "start": 7687660,
-            "end": 7694602,
+            "start": 10684851,
+            "end": 10691793,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/assets/1x/cry_gameset.png",
             "crunched": 0,
-            "start": 7694602,
-            "end": 7696347,
+            "start": 10691793,
+            "end": 10693538,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/assets/1x/cry_icon.png",
             "crunched": 0,
-            "start": 7696347,
-            "end": 7696923,
+            "start": 10693538,
+            "end": 10694114,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/assets/1x/cry_misc.png",
             "crunched": 0,
-            "start": 7696923,
-            "end": 7723207,
+            "start": 10694114,
+            "end": 10720398,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/assets/1x/goofy.png",
             "crunched": 0,
-            "start": 7723207,
-            "end": 7728641,
+            "start": 10720398,
+            "end": 10725832,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/assets/1x/hands.png",
             "crunched": 0,
-            "start": 7728641,
-            "end": 7729053,
+            "start": 10725832,
+            "end": 10726244,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/assets/1x/intercept_sprite.aseprite",
             "crunched": 0,
-            "start": 7729053,
-            "end": 7732300,
+            "start": 10726244,
+            "end": 10729491,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/assets/1x/j_cry_jimball.png",
             "crunched": 0,
-            "start": 7732300,
-            "end": 7778948,
+            "start": 10729491,
+            "end": 10776139,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/assets/1x/jolly.png",
             "crunched": 0,
-            "start": 7778948,
-            "end": 8192842,
+            "start": 10776139,
+            "end": 11190033,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/assets/1x/old.png",
             "crunched": 0,
-            "start": 8192842,
-            "end": 8258624,
+            "start": 11190033,
+            "end": 11255815,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/assets/1x/pack_cry.png",
             "crunched": 0,
-            "start": 8258624,
-            "end": 8293974,
+            "start": 11255815,
+            "end": 11291165,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/assets/1x/placeholders.png",
             "crunched": 0,
-            "start": 8293974,
-            "end": 8307707,
+            "start": 11291165,
+            "end": 11304898,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/assets/1x/resize.py",
             "crunched": 0,
-            "start": 8307707,
-            "end": 8308526,
+            "start": 11304898,
+            "end": 11305717,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/assets/1x/shinyc.png",
             "crunched": 0,
-            "start": 8308526,
-            "end": 8319360,
+            "start": 11305717,
+            "end": 11316551,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/assets/1x/shinyv.png",
             "crunched": 0,
-            "start": 8319360,
-            "end": 8328051,
+            "start": 11316551,
+            "end": 11325242,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/assets/1x/sleeve_cry_glowing.png",
             "crunched": 0,
-            "start": 8328051,
-            "end": 8356592,
+            "start": 11325242,
+            "end": 11353783,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/assets/1x/stake_cry.png",
             "crunched": 0,
-            "start": 8356592,
-            "end": 8372679,
+            "start": 11353783,
+            "end": 11369870,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/assets/1x/sticker_cry.png",
             "crunched": 0,
-            "start": 8372679,
-            "end": 8377334,
+            "start": 11369870,
+            "end": 11374525,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/assets/1x/tag_cry.png",
             "crunched": 0,
-            "start": 8377334,
-            "end": 8392612,
+            "start": 11374525,
+            "end": 11389803,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/assets/2x/atlasdeck.png",
             "crunched": 0,
-            "start": 8392612,
-            "end": 8711349,
+            "start": 11389803,
+            "end": 11708540,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/assets/2x/atlaseditiondeck.png",
             "crunched": 0,
-            "start": 8711349,
-            "end": 8792610,
+            "start": 11708540,
+            "end": 11789801,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/assets/2x/atlasepic.png",
             "crunched": 0,
-            "start": 8792610,
-            "end": 8935612,
+            "start": 11789801,
+            "end": 11932803,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/assets/2x/atlasexotic.png",
             "crunched": 0,
-            "start": 8935612,
-            "end": 9172949,
+            "start": 11932803,
+            "end": 12170140,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/assets/2x/atlasnotjokers.png",
             "crunched": 0,
-            "start": 9172949,
-            "end": 9393965,
+            "start": 12170140,
+            "end": 12391156,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/assets/2x/atlasone.png",
             "crunched": 0,
-            "start": 9393965,
-            "end": 9556023,
+            "start": 12391156,
+            "end": 12553214,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/assets/2x/atlasSleeves.png",
             "crunched": 0,
-            "start": 9556023,
-            "end": 9616591,
+            "start": 12553214,
+            "end": 12613782,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/assets/2x/atlasspooky.png",
             "crunched": 0,
-            "start": 9616591,
-            "end": 9703269,
+            "start": 12613782,
+            "end": 12700460,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/assets/2x/atlasthree.png",
             "crunched": 0,
-            "start": 9703269,
-            "end": 9994959,
+            "start": 12700460,
+            "end": 12992150,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/assets/2x/atlastwo.png",
             "crunched": 0,
-            "start": 9994959,
-            "end": 10180931,
+            "start": 12992150,
+            "end": 13178122,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/assets/2x/atlasvoucher.png",
             "crunched": 0,
-            "start": 10180931,
-            "end": 10398443,
+            "start": 13178122,
+            "end": 13395634,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/assets/2x/b_cry_glowing.png",
             "crunched": 0,
-            "start": 10398443,
-            "end": 10445502,
+            "start": 13395634,
+            "end": 13442693,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/assets/2x/bl_cry_two.png",
             "crunched": 0,
-            "start": 10445502,
-            "end": 10457810,
+            "start": 13442693,
+            "end": 13455001,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/assets/2x/bl_cry.png",
             "crunched": 0,
-            "start": 10457810,
-            "end": 10530039,
+            "start": 13455001,
+            "end": 13527230,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/assets/2x/bl_nostalgia.png",
             "crunched": 0,
-            "start": 10530039,
-            "end": 10596530,
+            "start": 13527230,
+            "end": 13593721,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/assets/2x/cry_achievements.png",
             "crunched": 0,
-            "start": 10596530,
-            "end": 10611482,
+            "start": 13593721,
+            "end": 13608673,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/assets/2x/cry_gameset.png",
             "crunched": 0,
-            "start": 10611482,
-            "end": 10613700,
+            "start": 13608673,
+            "end": 13610891,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/assets/2x/cry_icon.png",
             "crunched": 0,
-            "start": 10613700,
-            "end": 10614403,
+            "start": 13610891,
+            "end": 13611594,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/assets/2x/cry_misc.png",
             "crunched": 0,
-            "start": 10614403,
-            "end": 10662632,
+            "start": 13611594,
+            "end": 13659823,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/assets/2x/goofy.png",
             "crunched": 0,
-            "start": 10662632,
-            "end": 10688741,
+            "start": 13659823,
+            "end": 13685932,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/assets/2x/hands.png",
             "crunched": 0,
-            "start": 10688741,
-            "end": 10689196,
+            "start": 13685932,
+            "end": 13686387,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/assets/2x/intercept_sprite.aseprite",
             "crunched": 0,
-            "start": 10689196,
-            "end": 10693745,
+            "start": 13686387,
+            "end": 13690936,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/assets/2x/j_cry_jimball.png",
             "crunched": 0,
-            "start": 10693745,
-            "end": 10753322,
+            "start": 13690936,
+            "end": 13750513,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/assets/2x/jolly.png",
             "crunched": 0,
-            "start": 10753322,
-            "end": 11513255,
+            "start": 13750513,
+            "end": 14510446,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/assets/2x/old.png",
             "crunched": 0,
-            "start": 11513255,
-            "end": 11639203,
+            "start": 14510446,
+            "end": 14636394,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/assets/2x/pack_cry.png",
             "crunched": 0,
-            "start": 11639203,
-            "end": 11685769,
+            "start": 14636394,
+            "end": 14682960,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/assets/2x/placeholders.png",
             "crunched": 0,
-            "start": 11685769,
-            "end": 11702613,
+            "start": 14682960,
+            "end": 14699804,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/assets/2x/resize.py",
             "crunched": 0,
-            "start": 11702613,
-            "end": 11703446,
+            "start": 14699804,
+            "end": 14700637,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/assets/2x/shinyc.png",
             "crunched": 0,
-            "start": 11703446,
-            "end": 11719511,
+            "start": 14700637,
+            "end": 14716702,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/assets/2x/shinyv.png",
             "crunched": 0,
-            "start": 11719511,
-            "end": 11734577,
+            "start": 14716702,
+            "end": 14731768,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/assets/2x/sleeve_cry_glowing.png",
             "crunched": 0,
-            "start": 11734577,
-            "end": 11774481,
+            "start": 14731768,
+            "end": 14771672,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/assets/2x/stake_cry.png",
             "crunched": 0,
-            "start": 11774481,
-            "end": 11795169,
+            "start": 14771672,
+            "end": 14792360,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/assets/2x/sticker_cry.png",
             "crunched": 0,
-            "start": 11795169,
-            "end": 11802759,
+            "start": 14792360,
+            "end": 14799950,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/assets/2x/tag_cry.png",
             "crunched": 0,
-            "start": 11802759,
-            "end": 11826809,
+            "start": 14799950,
+            "end": 14824000,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/assets/shaders/astral.fs",
             "crunched": 0,
-            "start": 11826809,
-            "end": 11836179,
+            "start": 14824000,
+            "end": 14833370,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/assets/shaders/blur.fs",
             "crunched": 0,
-            "start": 11836179,
-            "end": 11842864,
+            "start": 14833370,
+            "end": 14840055,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/assets/shaders/glass.fs",
             "crunched": 0,
-            "start": 11842864,
-            "end": 11847373,
+            "start": 14840055,
+            "end": 14844564,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/assets/shaders/glitched_b.fs",
             "crunched": 0,
-            "start": 11847373,
-            "end": 11856515,
+            "start": 14844564,
+            "end": 14853706,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/assets/shaders/glitched.fs",
             "crunched": 0,
-            "start": 11856515,
-            "end": 11861919,
+            "start": 14853706,
+            "end": 14859110,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/assets/shaders/gold.fs",
             "crunched": 0,
-            "start": 11861919,
-            "end": 11866561,
+            "start": 14859110,
+            "end": 14863752,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/assets/shaders/m.fs",
             "crunched": 0,
-            "start": 11866561,
-            "end": 11871675,
+            "start": 14863752,
+            "end": 14868866,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/assets/shaders/mosaic.fs",
             "crunched": 0,
-            "start": 11871675,
-            "end": 11877405,
+            "start": 14868866,
+            "end": 14874596,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/assets/shaders/noisy.fs",
             "crunched": 0,
-            "start": 11877405,
-            "end": 11881340,
+            "start": 14874596,
+            "end": 14878531,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/assets/shaders/oversat.fs",
             "crunched": 0,
-            "start": 11881340,
-            "end": 11888795,
+            "start": 14878531,
+            "end": 14885986,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/assets/shaders/ultrafoil.fs",
             "crunched": 0,
-            "start": 11888795,
-            "end": 11895451,
+            "start": 14885986,
+            "end": 14892642,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/assets/sounds/demitrigger.ogg",
             "crunched": 0,
-            "start": 11895451,
-            "end": 11944327,
+            "start": 14892642,
+            "end": 14916804,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/assets/sounds/e_blur.ogg",
             "crunched": 0,
-            "start": 11944327,
-            "end": 11950832,
+            "start": 14916804,
+            "end": 14923309,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/assets/sounds/e_double_sided.ogg",
             "crunched": 0,
-            "start": 11950832,
-            "end": 12082237,
+            "start": 14923309,
+            "end": 15054714,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/assets/sounds/e_fragile.ogg",
             "crunched": 0,
-            "start": 12082237,
-            "end": 12108310,
+            "start": 15054714,
+            "end": 15065636,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/assets/sounds/e_glitched.ogg",
             "crunched": 0,
-            "start": 12108310,
-            "end": 12126764,
+            "start": 15065636,
+            "end": 15084090,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/assets/sounds/e_golden.ogg",
             "crunched": 0,
-            "start": 12126764,
-            "end": 12208407,
+            "start": 15084090,
+            "end": 15110430,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/assets/sounds/e_jolly.ogg",
             "crunched": 0,
-            "start": 12208407,
-            "end": 12236598,
+            "start": 15110430,
+            "end": 15120879,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/assets/sounds/e_mosaic.ogg",
             "crunched": 0,
-            "start": 12236598,
-            "end": 12298686,
+            "start": 15120879,
+            "end": 15182967,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/assets/sounds/e_noisy.ogg",
             "crunched": 0,
-            "start": 12298686,
-            "end": 12370581,
+            "start": 15182967,
+            "end": 15202708,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/assets/sounds/e_oversaturated.ogg",
             "crunched": 0,
-            "start": 12370581,
-            "end": 12450682,
+            "start": 15202708,
+            "end": 15282809,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/assets/sounds/forcetrigger.ogg",
             "crunched": 0,
-            "start": 12450682,
-            "end": 12488127,
+            "start": 15282809,
+            "end": 15302973,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/assets/sounds/meow1.ogg",
             "crunched": 0,
-            "start": 12488127,
-            "end": 12508769,
+            "start": 15302973,
+            "end": 15312477,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/assets/sounds/meow2.ogg",
             "crunched": 0,
-            "start": 12508769,
-            "end": 12528981,
+            "start": 15312477,
+            "end": 15321642,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/assets/sounds/meow3.ogg",
             "crunched": 0,
-            "start": 12528981,
-            "end": 12549976,
+            "start": 15321642,
+            "end": 15330666,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/assets/sounds/meow4.ogg",
             "crunched": 0,
-            "start": 12549976,
-            "end": 12569947,
+            "start": 15330666,
+            "end": 15339925,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/assets/sounds/music_big.ogg",
             "crunched": 0,
-            "start": 12569947,
-            "end": 14934197,
+            "start": 15339925,
+            "end": 17704175,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/assets/sounds/music_code.ogg",
             "crunched": 0,
-            "start": 14934197,
-            "end": 17384396,
+            "start": 17704175,
+            "end": 20154374,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/assets/sounds/music_exotic.ogg",
             "crunched": 0,
-            "start": 17384396,
-            "end": 19569646,
+            "start": 20154374,
+            "end": 22339624,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/assets/sounds/music_jimball.ogg",
             "crunched": 0,
-            "start": 19569646,
-            "end": 20762777,
+            "start": 22339624,
+            "end": 23532755,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/assets/sounds/music_madness.ogg",
             "crunched": 0,
-            "start": 20762777,
-            "end": 22847176,
+            "start": 23532755,
+            "end": 25617154,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/assets/sounds/music_mainline.ogg",
             "crunched": 0,
-            "start": 22847176,
-            "end": 24984615,
+            "start": 25617154,
+            "end": 27754593,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/assets/sounds/music_modest.ogg",
             "crunched": 0,
-            "start": 24984615,
-            "end": 27084085,
+            "start": 27754593,
+            "end": 29854063,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/assets/sounds/speed.py",
             "crunched": 0,
-            "start": 27084085,
-            "end": 27084792,
+            "start": 29854063,
+            "end": 29854770,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/assets/sounds/studiofromhelsinki.ogg",
             "crunched": 0,
-            "start": 27084792,
-            "end": 27111887,
+            "start": 29854770,
+            "end": 29881865,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/assets/sounds/whapoosh.ogg",
             "crunched": 0,
-            "start": 27111887,
-            "end": 27141461,
+            "start": 29881865,
+            "end": 29893340,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/config.lua",
             "crunched": 0,
-            "start": 27141461,
-            "end": 27142129,
+            "start": 29893340,
+            "end": 29894008,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/Cryptid.json",
             "crunched": 0,
-            "start": 27142129,
-            "end": 27142656,
+            "start": 29894008,
+            "end": 29894535,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/Cryptid.lua",
             "crunched": 0,
-            "start": 27142656,
-            "end": 27159321,
+            "start": 29894535,
+            "end": 29911200,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/items/achievement.lua",
             "crunched": 0,
-            "start": 27159321,
-            "end": 27171956,
+            "start": 29911200,
+            "end": 29923835,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/items/blind.lua",
             "crunched": 0,
-            "start": 27171956,
-            "end": 27215217,
+            "start": 29923835,
+            "end": 29967096,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/items/challenge.lua",
             "crunched": 0,
-            "start": 27215217,
-            "end": 27226348,
+            "start": 29967096,
+            "end": 29978227,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/items/code.lua",
             "crunched": 0,
-            "start": 27226348,
-            "end": 27383582,
+            "start": 29978227,
+            "end": 30135461,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/items/deck.lua",
             "crunched": 0,
-            "start": 27383582,
-            "end": 27415411,
+            "start": 30135461,
+            "end": 30167290,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/items/enhanced.lua",
             "crunched": 0,
-            "start": 27415411,
-            "end": 27430786,
+            "start": 30167290,
+            "end": 30182665,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/items/epic.lua",
             "crunched": 0,
-            "start": 27430786,
-            "end": 27497415,
+            "start": 30182665,
+            "end": 30249294,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/items/exotic.lua",
             "crunched": 0,
-            "start": 27497415,
-            "end": 27542112,
+            "start": 30249294,
+            "end": 30293991,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/items/joker_display.lua",
             "crunched": 0,
-            "start": 27542112,
-            "end": 27603715,
+            "start": 30293991,
+            "end": 30355594,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/items/m.lua",
             "crunched": 0,
-            "start": 27603715,
-            "end": 27652990,
+            "start": 30355594,
+            "end": 30404869,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/items/misc_joker.lua",
             "crunched": 0,
-            "start": 27652990,
-            "end": 27905442,
+            "start": 30404869,
+            "end": 30657321,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/items/misc.lua",
             "crunched": 0,
-            "start": 27905442,
-            "end": 27969285,
+            "start": 30657321,
+            "end": 30721164,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/items/planet.lua",
             "crunched": 0,
-            "start": 27969285,
-            "end": 28019021,
+            "start": 30721164,
+            "end": 30770900,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/items/pointer.lua",
             "crunched": 0,
-            "start": 28019021,
-            "end": 28073314,
+            "start": 30770900,
+            "end": 30825193,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/items/sleeve.lua",
             "crunched": 0,
-            "start": 28073314,
-            "end": 28121954,
+            "start": 30825193,
+            "end": 30873833,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/items/spectral.lua",
             "crunched": 0,
-            "start": 28121954,
-            "end": 28158901,
+            "start": 30873833,
+            "end": 30910780,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/items/spooky.lua",
             "crunched": 0,
-            "start": 28158901,
-            "end": 28217993,
+            "start": 30910780,
+            "end": 30969872,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/items/stake.lua",
             "crunched": 0,
-            "start": 28217993,
-            "end": 28232576,
+            "start": 30969872,
+            "end": 30984455,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/items/tag.lua",
             "crunched": 0,
-            "start": 28232576,
-            "end": 28272296,
+            "start": 30984455,
+            "end": 31024175,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/items/test.lua",
             "crunched": 0,
-            "start": 28272296,
-            "end": 28278458,
+            "start": 31024175,
+            "end": 31030337,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/items/voucher.lua",
             "crunched": 0,
-            "start": 28278458,
-            "end": 28313957,
+            "start": 31030337,
+            "end": 31065836,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/lib/ascended.lua",
             "crunched": 0,
-            "start": 28313957,
-            "end": 28325224,
+            "start": 31065836,
+            "end": 31077103,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/lib/attributes.lua",
             "crunched": 0,
-            "start": 28325224,
-            "end": 28326019,
+            "start": 31077103,
+            "end": 31077898,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/lib/calculate.lua",
             "crunched": 0,
-            "start": 28326019,
-            "end": 28331563,
+            "start": 31077898,
+            "end": 31083442,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/lib/content.lua",
             "crunched": 0,
-            "start": 28331563,
-            "end": 28350150,
+            "start": 31083442,
+            "end": 31102029,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/lib/cross-mod.lua",
             "crunched": 0,
-            "start": 28350150,
-            "end": 28355693,
+            "start": 31102029,
+            "end": 31107572,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/lib/d20.lua",
             "crunched": 0,
-            "start": 28355693,
-            "end": 28356068,
+            "start": 31107572,
+            "end": 31107947,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/lib/event.lua",
             "crunched": 0,
-            "start": 28356068,
-            "end": 28357216,
+            "start": 31107947,
+            "end": 31109095,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/lib/forcetrigger.lua",
             "crunched": 0,
-            "start": 28357216,
-            "end": 28397164,
+            "start": 31109095,
+            "end": 31149043,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/lib/gameset.lua",
             "crunched": 0,
-            "start": 28397164,
-            "end": 28451549,
+            "start": 31149043,
+            "end": 31203428,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/lib/https.lua",
             "crunched": 0,
-            "start": 28451549,
-            "end": 28452558,
+            "start": 31203428,
+            "end": 31204437,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/lib/misc.lua",
             "crunched": 0,
-            "start": 28452558,
-            "end": 28492653,
+            "start": 31204437,
+            "end": 31244532,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/lib/misprintize.lua",
             "crunched": 0,
-            "start": 28492653,
-            "end": 28510613,
+            "start": 31244532,
+            "end": 31262492,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/lib/modifiers.lua",
             "crunched": 0,
-            "start": 28510613,
-            "end": 28538293,
+            "start": 31262492,
+            "end": 31290172,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/lib/notifications.lua",
             "crunched": 0,
-            "start": 28538293,
-            "end": 28543474,
+            "start": 31290172,
+            "end": 31295353,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/lib/overrides.lua",
             "crunched": 0,
-            "start": 28543474,
-            "end": 28612495,
+            "start": 31295353,
+            "end": 31364374,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/lib/pointerlib.lua",
             "crunched": 0,
-            "start": 28612495,
-            "end": 28617801,
+            "start": 31364374,
+            "end": 31369680,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/lib/ui.lua",
             "crunched": 0,
-            "start": 28617801,
-            "end": 28630152,
+            "start": 31369680,
+            "end": 31382031,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/LICENSE",
             "crunched": 0,
-            "start": 28630152,
-            "end": 28665301,
+            "start": 31382031,
+            "end": 31417180,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/localization/de.lua",
             "crunched": 0,
-            "start": 28665301,
-            "end": 28824999,
+            "start": 31417180,
+            "end": 31576878,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/localization/en-us.lua",
             "crunched": 0,
-            "start": 28824999,
-            "end": 28979650,
+            "start": 31576878,
+            "end": 31731529,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/localization/es_419.lua",
             "crunched": 0,
-            "start": 28979650,
-            "end": 29093186,
+            "start": 31731529,
+            "end": 31845065,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/localization/es_ES.lua",
             "crunched": 0,
-            "start": 29093186,
-            "end": 29237388,
+            "start": 31845065,
+            "end": 31989267,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/localization/fr.lua",
             "crunched": 0,
-            "start": 29237388,
-            "end": 29400021,
+            "start": 31989267,
+            "end": 32151900,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/localization/id.lua",
             "crunched": 0,
-            "start": 29400021,
-            "end": 29490768,
+            "start": 32151900,
+            "end": 32242647,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/localization/ja.lua",
             "crunched": 0,
-            "start": 29490768,
-            "end": 29663487,
+            "start": 32242647,
+            "end": 32415366,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/localization/ko.lua",
             "crunched": 0,
-            "start": 29663487,
-            "end": 29824917,
+            "start": 32415366,
+            "end": 32576796,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/localization/nl.lua",
             "crunched": 0,
-            "start": 29824917,
-            "end": 29914909,
+            "start": 32576796,
+            "end": 32666788,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/localization/pl.lua",
             "crunched": 0,
-            "start": 29914909,
-            "end": 30032163,
+            "start": 32666788,
+            "end": 32784042,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/localization/pt_BR.lua",
             "crunched": 0,
-            "start": 30032163,
-            "end": 30172116,
+            "start": 32784042,
+            "end": 32923995,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/localization/ru.lua",
             "crunched": 0,
-            "start": 30172116,
-            "end": 30345671,
+            "start": 32923995,
+            "end": 33097550,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/localization/tools/find_missing_adv.py",
             "crunched": 0,
-            "start": 30345671,
-            "end": 30347051,
+            "start": 33097550,
+            "end": 33098930,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/localization/tools/find_missing.py",
             "crunched": 0,
-            "start": 30347051,
-            "end": 30347735,
+            "start": 33098930,
+            "end": 33099614,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/localization/vi.lua",
             "crunched": 0,
-            "start": 30347735,
-            "end": 30489305,
+            "start": 33099614,
+            "end": 33241184,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/localization/zh_CN.lua",
             "crunched": 0,
-            "start": 30489305,
-            "end": 30644752,
+            "start": 33241184,
+            "end": 33396631,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/localization/zh_TW.lua",
             "crunched": 0,
-            "start": 30644752,
-            "end": 30735465,
+            "start": 33396631,
+            "end": 33487344,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/lovely/abstracted.toml",
             "crunched": 0,
-            "start": 30735465,
-            "end": 30740222,
+            "start": 33487344,
+            "end": 33492101,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/lovely/achievement.toml",
             "crunched": 0,
-            "start": 30740222,
-            "end": 30741687,
+            "start": 33492101,
+            "end": 33493566,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/lovely/Ascended.toml",
             "crunched": 0,
-            "start": 30741687,
-            "end": 30747859,
+            "start": 33493566,
+            "end": 33499738,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/lovely/blind.toml",
             "crunched": 0,
-            "start": 30747859,
-            "end": 30755505,
+            "start": 33499738,
+            "end": 33507384,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/lovely/cat.toml",
             "crunched": 0,
-            "start": 30755505,
-            "end": 30764457,
+            "start": 33507384,
+            "end": 33516336,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/lovely/ccd.toml",
             "crunched": 0,
-            "start": 30764457,
-            "end": 30769679,
+            "start": 33516336,
+            "end": 33521558,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/lovely/challenges.toml",
             "crunched": 0,
-            "start": 30769679,
-            "end": 30770451,
+            "start": 33521558,
+            "end": 33522330,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/lovely/code.toml",
             "crunched": 0,
-            "start": 30770451,
-            "end": 30791132,
+            "start": 33522330,
+            "end": 33543011,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/lovely/conveyor.toml",
             "crunched": 0,
-            "start": 30791132,
-            "end": 30792311,
+            "start": 33543011,
+            "end": 33544190,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/lovely/equilibrium.toml",
             "crunched": 0,
-            "start": 30792311,
-            "end": 30793021,
+            "start": 33544190,
+            "end": 33544900,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/lovely/lib_gameset.toml",
             "crunched": 0,
-            "start": 30793021,
-            "end": 30800550,
+            "start": 33544900,
+            "end": 33552429,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/lovely/lib_https.toml",
             "crunched": 0,
-            "start": 30800550,
-            "end": 30800871,
+            "start": 33552429,
+            "end": 33552750,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/lovely/lib_misc.toml",
             "crunched": 0,
-            "start": 30800871,
-            "end": 30808576,
+            "start": 33552750,
+            "end": 33560455,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/lovely/lib_modifiers.toml",
             "crunched": 0,
-            "start": 30808576,
-            "end": 30811616,
+            "start": 33560455,
+            "end": 33563495,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/lovely/lib_ui.toml",
             "crunched": 0,
-            "start": 30811616,
-            "end": 30816069,
+            "start": 33563495,
+            "end": 33567948,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/lovely/misc.toml",
             "crunched": 0,
-            "start": 30816069,
-            "end": 30836063,
+            "start": 33567948,
+            "end": 33587942,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/lovely/misprint.toml",
             "crunched": 0,
-            "start": 30836063,
-            "end": 30855051,
+            "start": 33587942,
+            "end": 33606930,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/lovely/none.toml",
             "crunched": 0,
-            "start": 30855051,
-            "end": 30865217,
+            "start": 33606930,
+            "end": 33617096,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/lovely/planet.toml",
             "crunched": 0,
-            "start": 30865217,
-            "end": 30866433,
+            "start": 33617096,
+            "end": 33618312,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/lovely/Probability.toml",
             "crunched": 0,
-            "start": 30866433,
-            "end": 30868139,
+            "start": 33618312,
+            "end": 33620018,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/lovely/seal.toml",
             "crunched": 0,
-            "start": 30868139,
-            "end": 30868608,
+            "start": 33620018,
+            "end": 33620487,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/lovely/spooky.toml",
             "crunched": 0,
-            "start": 30868608,
-            "end": 30870290,
+            "start": 33620487,
+            "end": 33622169,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/lovely/stake.toml",
             "crunched": 0,
-            "start": 30870290,
-            "end": 30884522,
+            "start": 33622169,
+            "end": 33636401,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/lovely/sticker.toml",
             "crunched": 0,
-            "start": 30884522,
-            "end": 30888882,
+            "start": 33636401,
+            "end": 33640761,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/lovely/very_fair.toml",
             "crunched": 0,
-            "start": 30888882,
-            "end": 30891061,
+            "start": 33640761,
+            "end": 33642940,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/lovely/Voucher.toml",
             "crunched": 0,
-            "start": 30891061,
-            "end": 30897766,
+            "start": 33642940,
+            "end": 33649645,
             "audio": false
         },
         {
             "filename": "/Mods/Cryptid/README.md",
             "crunched": 0,
-            "start": 30897766,
-            "end": 30901322,
+            "start": 33649645,
+            "end": 33653201,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/Galdur/assets/1x/galdur_icon.png",
+            "crunched": 0,
+            "start": 33653201,
+            "end": 33654217,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/Galdur/assets/1x/locked_stake.png",
+            "crunched": 0,
+            "start": 33654217,
+            "end": 33655470,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/Galdur/assets/2x/galdur_icon.png",
+            "crunched": 0,
+            "start": 33655470,
+            "end": 33656610,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/Galdur/assets/2x/locked_stake.png",
+            "crunched": 0,
+            "start": 33656610,
+            "end": 33658095,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/Galdur/assets/2x/stickers.png",
+            "crunched": 0,
+            "start": 33658095,
+            "end": 33664833,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/Galdur/config.lua",
+            "crunched": 0,
+            "start": 33664833,
+            "end": 33664989,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/Galdur/galdur.lua",
+            "crunched": 0,
+            "start": 33664989,
+            "end": 33721603,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/Galdur/localization/default.lua",
+            "crunched": 0,
+            "start": 33721603,
+            "end": 33723625,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/Galdur/localization/pt_BR.lua",
+            "crunched": 0,
+            "start": 33723625,
+            "end": 33725756,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/Galdur/localization/zh_CN.lua",
+            "crunched": 0,
+            "start": 33725756,
+            "end": 33727674,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/Galdur/lovely.toml",
+            "crunched": 0,
+            "start": 33727674,
+            "end": 33731406,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/Galdur/manifest.json",
+            "crunched": 0,
+            "start": 33731406,
+            "end": 33731813,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/Galdur/README.md",
+            "crunched": 0,
+            "start": 33731813,
+            "end": 33733288,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/Galdur/utils/EremelUtility.lua",
+            "crunched": 0,
+            "start": 33733288,
+            "end": 33740714,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/HandyBalatro/.gitignore",
+            "crunched": 0,
+            "start": 33740714,
+            "end": 33740736,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/HandyBalatro/assets/1x/icon.png",
+            "crunched": 0,
+            "start": 33740736,
+            "end": 33741250,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/HandyBalatro/assets/2x/icon.png",
+            "crunched": 0,
+            "start": 33741250,
+            "end": 33741861,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/HandyBalatro/index.lua",
+            "crunched": 0,
+            "start": 33741861,
+            "end": 33747252,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/HandyBalatro/loc_txt/en-us.lua",
+            "crunched": 0,
+            "start": 33747252,
+            "end": 33774658,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/HandyBalatro/loc_txt/es_419.lua",
+            "crunched": 0,
+            "start": 33774658,
+            "end": 33805158,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/HandyBalatro/loc_txt/es_ES.lua",
+            "crunched": 0,
+            "start": 33805158,
+            "end": 33835862,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/HandyBalatro/loc_txt/ru.lua",
+            "crunched": 0,
+            "start": 33835862,
+            "end": 33870504,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/HandyBalatro/loc_txt/zh_CN.lua",
+            "crunched": 0,
+            "start": 33870504,
+            "end": 33896772,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/HandyBalatro/lovely/controller.toml",
+            "crunched": 0,
+            "start": 33896772,
+            "end": 33900302,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/HandyBalatro/lovely/controls_animation_skip.toml",
+            "crunched": 0,
+            "start": 33900302,
+            "end": 33904971,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/HandyBalatro/lovely/controls_deselect_hand.toml",
+            "crunched": 0,
+            "start": 33904971,
+            "end": 33905313,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/HandyBalatro/lovely/controls_insta_booster_skip.toml",
+            "crunched": 0,
+            "start": 33905313,
+            "end": 33905643,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/HandyBalatro/lovely/controls_insta_cash_out.toml",
+            "crunched": 0,
+            "start": 33905643,
+            "end": 33906503,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/HandyBalatro/lovely/controls_misc.toml",
+            "crunched": 0,
+            "start": 33906503,
+            "end": 33907346,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/HandyBalatro/lovely/controls_regular_keybinds.toml",
+            "crunched": 0,
+            "start": 33907346,
+            "end": 33907995,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/HandyBalatro/lovely/controls_scoring_hold.toml",
+            "crunched": 0,
+            "start": 33907995,
+            "end": 33908332,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/HandyBalatro/lovely/controls_show_deck_preview.toml",
+            "crunched": 0,
+            "start": 33908332,
+            "end": 33908624,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/HandyBalatro/lovely/controls_speed_multiplier.toml",
+            "crunched": 0,
+            "start": 33908624,
+            "end": 33909422,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/HandyBalatro/lovely/init.toml",
+            "crunched": 0,
+            "start": 33909422,
+            "end": 33913488,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/HandyBalatro/lovely/localization.toml",
+            "crunched": 0,
+            "start": 33913488,
+            "end": 33914156,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/HandyBalatro/lovely/ui.toml",
+            "crunched": 0,
+            "start": 33914156,
+            "end": 33916440,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/HandyBalatro/metadata.json",
+            "crunched": 0,
+            "start": 33916440,
+            "end": 33916739,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/HandyBalatro/modules/config.lua",
+            "crunched": 0,
+            "start": 33916739,
+            "end": 33928383,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/HandyBalatro/modules/controller.lua",
+            "crunched": 0,
+            "start": 33928383,
+            "end": 33962764,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/HandyBalatro/modules/controls/animation_skip.lua",
+            "crunched": 0,
+            "start": 33962764,
+            "end": 33974989,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/HandyBalatro/modules/controls/dangerous_actions.lua",
+            "crunched": 0,
+            "start": 33974989,
+            "end": 33984768,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/HandyBalatro/modules/controls/deselect_hand.lua",
+            "crunched": 0,
+            "start": 33984768,
+            "end": 33985663,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/HandyBalatro/modules/controls/insta_actions.lua",
+            "crunched": 0,
+            "start": 33985663,
+            "end": 33996424,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/HandyBalatro/modules/controls/insta_booster_skip.lua",
+            "crunched": 0,
+            "start": 33996424,
+            "end": 33997959,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/HandyBalatro/modules/controls/insta_cash_out.lua",
+            "crunched": 0,
+            "start": 33997959,
+            "end": 33999064,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/HandyBalatro/modules/controls/insta_highlight_entire_f_hand.lua",
+            "crunched": 0,
+            "start": 33999064,
+            "end": 34000005,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/HandyBalatro/modules/controls/insta_highlight.lua",
+            "crunched": 0,
+            "start": 34000005,
+            "end": 34001628,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/HandyBalatro/modules/controls/misc.lua",
+            "crunched": 0,
+            "start": 34001628,
+            "end": 34007605,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/HandyBalatro/modules/controls/move_highlight.lua",
+            "crunched": 0,
+            "start": 34007605,
+            "end": 34010184,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/HandyBalatro/modules/controls/nopeus_interaction.lua",
+            "crunched": 0,
+            "start": 34010184,
+            "end": 34013914,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/HandyBalatro/modules/controls/not_just_yet_interaction.lua",
+            "crunched": 0,
+            "start": 34013914,
+            "end": 34014990,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/HandyBalatro/modules/controls/presets_switch.lua",
+            "crunched": 0,
+            "start": 34014990,
+            "end": 34019125,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/HandyBalatro/modules/controls/regular_keybinds.lua",
+            "crunched": 0,
+            "start": 34019125,
+            "end": 34030124,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/HandyBalatro/modules/controls/scoring_hold.lua",
+            "crunched": 0,
+            "start": 34030124,
+            "end": 34032139,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/HandyBalatro/modules/controls/show_deck_preview.lua",
+            "crunched": 0,
+            "start": 34032139,
+            "end": 34032680,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/HandyBalatro/modules/controls/speed_multiplier.lua",
+            "crunched": 0,
+            "start": 34032680,
+            "end": 34037481,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/HandyBalatro/modules/fake_events.lua",
+            "crunched": 0,
+            "start": 34037481,
+            "end": 34039545,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/HandyBalatro/modules/presets.lua",
+            "crunched": 0,
+            "start": 34039545,
+            "end": 34044044,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/HandyBalatro/modules/ui/config_dictionary.lua",
+            "crunched": 0,
+            "start": 34044044,
+            "end": 34098309,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/HandyBalatro/modules/ui/config_tabs.lua",
+            "crunched": 0,
+            "start": 34098309,
+            "end": 34126779,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/HandyBalatro/modules/ui/config.lua",
+            "crunched": 0,
+            "start": 34126779,
+            "end": 34129593,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/HandyBalatro/modules/ui/functions.lua",
+            "crunched": 0,
+            "start": 34129593,
+            "end": 34137085,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/HandyBalatro/modules/ui/index.lua",
+            "crunched": 0,
+            "start": 34137085,
+            "end": 34138729,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/HandyBalatro/modules/ui/parts.lua",
+            "crunched": 0,
+            "start": 34138729,
+            "end": 34156940,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/HandyBalatro/modules/ui/state_panel.lua",
+            "crunched": 0,
+            "start": 34156940,
+            "end": 34161894,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/HandyBalatro/modules/utils.lua",
+            "crunched": 0,
+            "start": 34161894,
+            "end": 34166405,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/HandyBalatro/steamodded.lua",
+            "crunched": 0,
+            "start": 34166405,
+            "end": 34168205,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/JenLib/JenLib.lua",
+            "crunched": 0,
+            "start": 34168205,
+            "end": 34199690,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/JenLib/LICENSE",
+            "crunched": 0,
+            "start": 34199690,
+            "end": 34235513,
             "audio": false
         },
         {
             "filename": "/Mods/lovely/blacklist.txt",
             "crunched": 0,
-            "start": 30901322,
-            "end": 30901331,
+            "start": 34235513,
+            "end": 34235522,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/dump/back.lua",
+            "filename": "/Mods/Multiplayer/.env.example",
             "crunched": 0,
-            "start": 30901331,
-            "end": 30916772,
+            "start": 34235522,
+            "end": 34235754,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/dump/back.lua.json",
+            "filename": "/Mods/Multiplayer/.gitignore",
             "crunched": 0,
-            "start": 30916772,
-            "end": 30922151,
+            "start": 34235754,
+            "end": 34235872,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/dump/blind.lua",
+            "filename": "/Mods/Multiplayer/agents.md",
             "crunched": 0,
-            "start": 30922151,
-            "end": 30956467,
+            "start": 34235872,
+            "end": 34256419,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/dump/blind.lua.json",
+            "filename": "/Mods/Multiplayer/assets/1x/alt_mp_stakes.png",
             "crunched": 0,
-            "start": 30956467,
-            "end": 30975296,
+            "start": 34256419,
+            "end": 34260667,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/dump/card_character.lua",
+            "filename": "/Mods/Multiplayer/assets/1x/alt_stickers.png",
             "crunched": 0,
-            "start": 30975296,
-            "end": 30982139,
+            "start": 34260667,
+            "end": 34262221,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/dump/card_character.lua.json",
+            "filename": "/Mods/Multiplayer/assets/1x/b_heidelberg.png",
             "crunched": 0,
-            "start": 30982139,
-            "end": 30986387,
+            "start": 34262221,
+            "end": 34263428,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/dump/card.lua",
+            "filename": "/Mods/Multiplayer/assets/1x/blind_col.png",
             "crunched": 0,
-            "start": 30986387,
-            "end": 31297230,
+            "start": 34263428,
+            "end": 34368764,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/dump/card.lua.json",
+            "filename": "/Mods/Multiplayer/assets/1x/c_asteroid_ru.png",
             "crunched": 0,
-            "start": 31297230,
-            "end": 31431652,
+            "start": 34368764,
+            "end": 34394009,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/dump/cardarea.lua",
+            "filename": "/Mods/Multiplayer/assets/1x/c_asteroid.png",
             "crunched": 0,
-            "start": 31431652,
-            "end": 31469449,
+            "start": 34394009,
+            "end": 34401061,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/dump/cardarea.lua.json",
+            "filename": "/Mods/Multiplayer/assets/1x/c_ouija_2.png",
             "crunched": 0,
-            "start": 31469449,
-            "end": 31482230,
+            "start": 34401061,
+            "end": 34402460,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/dump/engine/animatedsprite.lua",
+            "filename": "/Mods/Multiplayer/assets/1x/deck_stickers.png",
             "crunched": 0,
-            "start": 31482230,
-            "end": 31485562,
+            "start": 34402460,
+            "end": 34429086,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/dump/engine/animatedsprite.lua.json",
+            "filename": "/Mods/Multiplayer/assets/1x/decks.png",
             "crunched": 0,
-            "start": 31485562,
-            "end": 31486853,
+            "start": 34429086,
+            "end": 34456085,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/dump/engine/controller.lua",
+            "filename": "/Mods/Multiplayer/assets/1x/ec_jokers_sandbox.png",
             "crunched": 0,
-            "start": 31486853,
-            "end": 31551744,
+            "start": 34456085,
+            "end": 34654383,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/dump/engine/controller.lua.json",
+            "filename": "/Mods/Multiplayer/assets/1x/ec_other_sandbox.png",
             "crunched": 0,
-            "start": 31551744,
-            "end": 31555045,
+            "start": 34654383,
+            "end": 34759760,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/dump/engine/event.lua",
+            "filename": "/Mods/Multiplayer/assets/1x/j_baseball_sandbox.png",
             "crunched": 0,
-            "start": 31555045,
-            "end": 31562104,
+            "start": 34759760,
+            "end": 34770628,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/dump/engine/event.lua.json",
+            "filename": "/Mods/Multiplayer/assets/1x/j_bloodstone_sandbox.png",
             "crunched": 0,
-            "start": 31562104,
-            "end": 31564427,
+            "start": 34770628,
+            "end": 34777662,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/dump/engine/moveable.lua",
+            "filename": "/Mods/Multiplayer/assets/1x/j_castle_sandbox.png",
             "crunched": 0,
-            "start": 31564427,
-            "end": 31585892,
+            "start": 34777662,
+            "end": 34787876,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/dump/engine/moveable.lua.json",
+            "filename": "/Mods/Multiplayer/assets/1x/j_cloud_9_sandbox.png",
             "crunched": 0,
-            "start": 31585892,
-            "end": 31587150,
+            "start": 34787876,
+            "end": 34796569,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/dump/engine/node.lua",
+            "filename": "/Mods/Multiplayer/assets/1x/j_conjoined_joker.png",
             "crunched": 0,
-            "start": 31587150,
-            "end": 31603325,
+            "start": 34796569,
+            "end": 34799491,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/dump/engine/node.lua.json",
+            "filename": "/Mods/Multiplayer/assets/1x/j_constellation_sandbox.png",
             "crunched": 0,
-            "start": 31603325,
-            "end": 31603962,
+            "start": 34799491,
+            "end": 34810228,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/dump/engine/save_manager.lua",
+            "filename": "/Mods/Multiplayer/assets/1x/j_copycat.png",
             "crunched": 0,
-            "start": 31603962,
-            "end": 31608567,
+            "start": 34810228,
+            "end": 34816949,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/dump/engine/save_manager.lua.json",
+            "filename": "/Mods/Multiplayer/assets/1x/j_defensive_joker.png",
             "crunched": 0,
-            "start": 31608567,
-            "end": 31609503,
+            "start": 34816949,
+            "end": 34818917,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/dump/engine/sound_manager.lua",
+            "filename": "/Mods/Multiplayer/assets/1x/j_ERROR_sandbox.png",
             "crunched": 0,
-            "start": 31609503,
-            "end": 31616962,
+            "start": 34818917,
+            "end": 34819733,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/dump/engine/sound_manager.lua.json",
+            "filename": "/Mods/Multiplayer/assets/1x/j_faceless_sandbox.png",
             "crunched": 0,
-            "start": 31616962,
-            "end": 31619633,
+            "start": 34819733,
+            "end": 34826152,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/dump/engine/sprite.lua",
+            "filename": "/Mods/Multiplayer/assets/1x/j_hit_the_road_sandbox.png",
             "crunched": 0,
-            "start": 31619633,
-            "end": 31629227,
+            "start": 34826152,
+            "end": 34838137,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/dump/engine/sprite.lua.json",
+            "filename": "/Mods/Multiplayer/assets/1x/j_idol_sandbox_bw.png",
             "crunched": 0,
-            "start": 31629227,
-            "end": 31631232,
+            "start": 34838137,
+            "end": 34840858,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/dump/engine/string_packer.lua",
+            "filename": "/Mods/Multiplayer/assets/1x/j_idol_sandbox_color.png",
             "crunched": 0,
-            "start": 31631232,
-            "end": 31634318,
+            "start": 34840858,
+            "end": 34846025,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/dump/engine/string_packer.lua.json",
+            "filename": "/Mods/Multiplayer/assets/1x/j_juggler_sandbox.png",
             "crunched": 0,
-            "start": 31634318,
-            "end": 31634930,
+            "start": 34846025,
+            "end": 34854562,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/dump/engine/text.lua",
+            "filename": "/Mods/Multiplayer/assets/1x/j_lets_go_gambling.png",
             "crunched": 0,
-            "start": 31634930,
-            "end": 31657212,
+            "start": 34854562,
+            "end": 34858175,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/dump/engine/text.lua.json",
+            "filename": "/Mods/Multiplayer/assets/1x/j_loyalty_card_sandbox.png",
             "crunched": 0,
-            "start": 31657212,
-            "end": 31667895,
+            "start": 34858175,
+            "end": 34868124,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/dump/engine/ui.lua",
+            "filename": "/Mods/Multiplayer/assets/1x/j_lucky_cat_sandbox.png",
             "crunched": 0,
-            "start": 31667895,
-            "end": 31717974,
+            "start": 34868124,
+            "end": 34880625,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/dump/engine/ui.lua.json",
+            "filename": "/Mods/Multiplayer/assets/1x/j_magnet.png",
             "crunched": 0,
-            "start": 31717974,
-            "end": 31726169,
+            "start": 34880625,
+            "end": 34885420,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/dump/functions/button_callbacks.lua",
+            "filename": "/Mods/Multiplayer/assets/1x/j_mail_sandbox.png",
             "crunched": 0,
-            "start": 31726169,
-            "end": 31851112,
+            "start": 34885420,
+            "end": 34894548,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/dump/functions/button_callbacks.lua.json",
+            "filename": "/Mods/Multiplayer/assets/1x/j_misprint_sandbox.png",
             "crunched": 0,
-            "start": 31851112,
-            "end": 31885350,
+            "start": 34894548,
+            "end": 34899036,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/dump/functions/common_events.lua",
+            "filename": "/Mods/Multiplayer/assets/1x/j_order_sandbox.png",
             "crunched": 0,
-            "start": 31885350,
-            "end": 32087453,
+            "start": 34899036,
+            "end": 34907647,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/dump/functions/common_events.lua.json",
+            "filename": "/Mods/Multiplayer/assets/1x/j_pacifist.png",
             "crunched": 0,
-            "start": 32087453,
-            "end": 32181758,
+            "start": 34907647,
+            "end": 34909632,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/dump/functions/misc_functions.lua",
+            "filename": "/Mods/Multiplayer/assets/1x/j_penny_pincher.png",
             "crunched": 0,
-            "start": 32181758,
-            "end": 32264423,
+            "start": 34909632,
+            "end": 34911927,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/dump/functions/misc_functions.lua.json",
+            "filename": "/Mods/Multiplayer/assets/1x/j_photograph_sandbox.png",
             "crunched": 0,
-            "start": 32264423,
-            "end": 32299399,
+            "start": 34911927,
+            "end": 34922067,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/dump/functions/state_events.lua",
+            "filename": "/Mods/Multiplayer/assets/1x/j_pizza.png",
             "crunched": 0,
-            "start": 32299399,
-            "end": 32383478,
+            "start": 34922067,
+            "end": 34925465,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/dump/functions/state_events.lua.json",
+            "filename": "/Mods/Multiplayer/assets/1x/j_ride_the_bus_sandbox.png",
             "crunched": 0,
-            "start": 32383478,
-            "end": 32440308,
+            "start": 34925465,
+            "end": 34927209,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/dump/functions/UI_definitions.lua",
+            "filename": "/Mods/Multiplayer/assets/1x/j_runner_sandbox.png",
             "crunched": 0,
-            "start": 32440308,
-            "end": 32819841,
+            "start": 34927209,
+            "end": 34933973,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/dump/functions/UI_definitions.lua.json",
+            "filename": "/Mods/Multiplayer/assets/1x/j_satellite_sandbox.png",
             "crunched": 0,
-            "start": 32819841,
-            "end": 32892049,
+            "start": 34933973,
+            "end": 34941126,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/dump/game.lua",
+            "filename": "/Mods/Multiplayer/assets/1x/j_skip_off.png",
             "crunched": 0,
-            "start": 32892049,
-            "end": 33147259,
+            "start": 34941126,
+            "end": 34942922,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/dump/game.lua.json",
+            "filename": "/Mods/Multiplayer/assets/1x/j_speedrun.png",
             "crunched": 0,
-            "start": 33147259,
-            "end": 33191875,
+            "start": 34942922,
+            "end": 34943537,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/dump/globals.lua",
+            "filename": "/Mods/Multiplayer/assets/1x/j_square_sandbox.png",
             "crunched": 0,
-            "start": 33191875,
-            "end": 33213838,
+            "start": 34943537,
+            "end": 34947769,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/dump/globals.lua.json",
+            "filename": "/Mods/Multiplayer/assets/1x/j_steel_joker_sandbox.png",
             "crunched": 0,
-            "start": 33213838,
-            "end": 33215262,
+            "start": 34947769,
+            "end": 34953811,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/dump/lovely/SMODS/preflight/core/src/preflight/core.lua",
+            "filename": "/Mods/Multiplayer/assets/1x/j_taxes.png",
             "crunched": 0,
-            "start": 33215262,
-            "end": 33220851,
+            "start": 34953811,
+            "end": 34960852,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/dump/lovely/SMODS/preflight/core/src/preflight/core.lua.json",
+            "filename": "/Mods/Multiplayer/assets/1x/j_throwback_sandbox.png",
             "crunched": 0,
-            "start": 33220851,
-            "end": 33221267,
+            "start": 34960852,
+            "end": 34970637,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/dump/main.lua",
+            "filename": "/Mods/Multiplayer/assets/1x/j_vampire_sandbox.png",
             "crunched": 0,
-            "start": 33221267,
-            "end": 33334139,
+            "start": 34970637,
+            "end": 34977741,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/dump/main.lua.json",
+            "filename": "/Mods/Multiplayer/assets/1x/modicon.png",
             "crunched": 0,
-            "start": 33334139,
-            "end": 33340322,
+            "start": 34977741,
+            "end": 34978211,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/dump/SMODS/_/src/card_draw.lua",
+            "filename": "/Mods/Multiplayer/assets/1x/player_blind_row.png",
             "crunched": 0,
-            "start": 33340322,
-            "end": 33368633,
+            "start": 34978211,
+            "end": 34979781,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/dump/SMODS/_/src/card_draw.lua.json",
+            "filename": "/Mods/Multiplayer/assets/1x/release_jokers.png",
             "crunched": 0,
-            "start": 33368633,
-            "end": 33370336,
+            "start": 34979781,
+            "end": 35569079,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/dump/SMODS/_/src/game_object.lua",
+            "filename": "/Mods/Multiplayer/assets/1x/stakes-chips.png",
             "crunched": 0,
-            "start": 33370336,
-            "end": 33542912,
+            "start": 35569079,
+            "end": 35571109,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/dump/SMODS/_/src/game_object.lua.json",
+            "filename": "/Mods/Multiplayer/assets/1x/standard_giga.png",
             "crunched": 0,
-            "start": 33542912,
-            "end": 33544595,
+            "start": 35571109,
+            "end": 35575093,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/dump/SMODS/_/src/overrides.lua",
+            "filename": "/Mods/Multiplayer/assets/1x/sticker_balanced.png",
             "crunched": 0,
-            "start": 33544595,
-            "end": 33661920,
+            "start": 35575093,
+            "end": 35579586,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/dump/SMODS/_/src/overrides.lua.json",
+            "filename": "/Mods/Multiplayer/assets/1x/sticker_nemesis.png",
             "crunched": 0,
-            "start": 33661920,
-            "end": 33665300,
+            "start": 35579586,
+            "end": 35580148,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/dump/SMODS/_/src/ui.lua",
+            "filename": "/Mods/Multiplayer/assets/1x/stickers.png",
             "crunched": 0,
-            "start": 33665300,
-            "end": 33797844,
+            "start": 35580148,
+            "end": 35584532,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/dump/SMODS/_/src/ui.lua.json",
+            "filename": "/Mods/Multiplayer/assets/1x/tag_gambling_sandbox.png",
             "crunched": 0,
-            "start": 33797844,
-            "end": 33798430,
+            "start": 35584532,
+            "end": 35586325,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/dump/SMODS/_/src/utils.lua",
+            "filename": "/Mods/Multiplayer/assets/2x/alt_mp_stakes.png",
             "crunched": 0,
-            "start": 33798430,
-            "end": 33971138,
+            "start": 35586325,
+            "end": 35608355,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/dump/SMODS/_/src/utils.lua.json",
+            "filename": "/Mods/Multiplayer/assets/2x/alt_stickers.png",
             "crunched": 0,
-            "start": 33971138,
-            "end": 33978207,
+            "start": 35608355,
+            "end": 35611823,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/dump/SMODS/Cryptid/items/code.lua",
+            "filename": "/Mods/Multiplayer/assets/2x/b_heidelberg.png",
             "crunched": 0,
-            "start": 33978207,
-            "end": 34135487,
+            "start": 35611823,
+            "end": 35614326,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/dump/SMODS/Cryptid/items/code.lua.json",
+            "filename": "/Mods/Multiplayer/assets/2x/blind_col.png",
             "crunched": 0,
-            "start": 34135487,
-            "end": 34135884,
+            "start": 35614326,
+            "end": 35806587,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/dump/tag.lua",
+            "filename": "/Mods/Multiplayer/assets/2x/c_asteroid_ru.png",
             "crunched": 0,
-            "start": 34135884,
-            "end": 34167235,
+            "start": 35806587,
+            "end": 35814299,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/dump/tag.lua.json",
+            "filename": "/Mods/Multiplayer/assets/2x/c_asteroid.png",
             "crunched": 0,
-            "start": 34167235,
-            "end": 34173908,
+            "start": 35814299,
+            "end": 35822517,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/game-dump/back.lua",
+            "filename": "/Mods/Multiplayer/assets/2x/c_ouija_2.png",
             "crunched": 0,
-            "start": 34173908,
-            "end": 34189349,
+            "start": 35822517,
+            "end": 35825456,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/game-dump/back.lua.json",
+            "filename": "/Mods/Multiplayer/assets/2x/deck_stickers.png",
             "crunched": 0,
-            "start": 34189349,
-            "end": 34189398,
+            "start": 35825456,
+            "end": 35866865,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/game-dump/blind.lua",
+            "filename": "/Mods/Multiplayer/assets/2x/decks.png",
             "crunched": 0,
-            "start": 34189398,
-            "end": 34223714,
+            "start": 35866865,
+            "end": 35917664,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/game-dump/blind.lua.json",
+            "filename": "/Mods/Multiplayer/assets/2x/ec_jokers_sandbox.png",
             "crunched": 0,
-            "start": 34223714,
-            "end": 34223764,
+            "start": 35917664,
+            "end": 36178922,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/game-dump/card_character.lua",
+            "filename": "/Mods/Multiplayer/assets/2x/ec_other_sandbox.png",
             "crunched": 0,
-            "start": 34223764,
-            "end": 34230607,
+            "start": 36178922,
+            "end": 36236722,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/game-dump/card_character.lua.json",
+            "filename": "/Mods/Multiplayer/assets/2x/j_baseball_sandbox.png",
             "crunched": 0,
-            "start": 34230607,
-            "end": 34230666,
+            "start": 36236722,
+            "end": 36263844,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/game-dump/card.lua",
+            "filename": "/Mods/Multiplayer/assets/2x/j_bloodstone_sandbox.png",
             "crunched": 0,
-            "start": 34230666,
-            "end": 34541509,
+            "start": 36263844,
+            "end": 36277186,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/game-dump/card.lua.json",
+            "filename": "/Mods/Multiplayer/assets/2x/j_castle_sandbox.png",
             "crunched": 0,
-            "start": 34541509,
-            "end": 34541558,
+            "start": 36277186,
+            "end": 36302284,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/game-dump/cardarea.lua",
+            "filename": "/Mods/Multiplayer/assets/2x/j_cloud_9_sandbox.png",
             "crunched": 0,
-            "start": 34541558,
-            "end": 34579355,
+            "start": 36302284,
+            "end": 36325240,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/game-dump/cardarea.lua.json",
+            "filename": "/Mods/Multiplayer/assets/2x/j_conjoined_joker.png",
             "crunched": 0,
-            "start": 34579355,
-            "end": 34579408,
+            "start": 36325240,
+            "end": 36328442,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/game-dump/engine/animatedsprite.lua",
+            "filename": "/Mods/Multiplayer/assets/2x/j_constellation_sandbox.png",
             "crunched": 0,
-            "start": 34579408,
-            "end": 34582740,
+            "start": 36328442,
+            "end": 36353929,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/game-dump/engine/animatedsprite.lua.json",
+            "filename": "/Mods/Multiplayer/assets/2x/j_copycat.png",
             "crunched": 0,
-            "start": 34582740,
-            "end": 34582806,
+            "start": 36353929,
+            "end": 36361458,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/game-dump/engine/controller.lua",
+            "filename": "/Mods/Multiplayer/assets/2x/j_defensive_joker.png",
             "crunched": 0,
-            "start": 34582806,
-            "end": 34647697,
+            "start": 36361458,
+            "end": 36363860,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/game-dump/engine/controller.lua.json",
+            "filename": "/Mods/Multiplayer/assets/2x/j_ERROR_sandbox.png",
             "crunched": 0,
-            "start": 34647697,
-            "end": 34647759,
+            "start": 36363860,
+            "end": 36365514,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/game-dump/engine/event.lua",
+            "filename": "/Mods/Multiplayer/assets/2x/j_faceless_sandbox.png",
             "crunched": 0,
-            "start": 34647759,
-            "end": 34654818,
+            "start": 36365514,
+            "end": 36380579,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/game-dump/engine/event.lua.json",
+            "filename": "/Mods/Multiplayer/assets/2x/j_hit_the_road_sandbox.png",
             "crunched": 0,
-            "start": 34654818,
-            "end": 34654875,
+            "start": 36380579,
+            "end": 36410404,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/game-dump/engine/moveable.lua",
+            "filename": "/Mods/Multiplayer/assets/2x/j_idol_sandbox_bw.png",
             "crunched": 0,
-            "start": 34654875,
-            "end": 34676340,
+            "start": 36410404,
+            "end": 36420859,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/game-dump/engine/moveable.lua.json",
+            "filename": "/Mods/Multiplayer/assets/2x/j_idol_sandbox_color.png",
             "crunched": 0,
-            "start": 34676340,
-            "end": 34676400,
+            "start": 36420859,
+            "end": 36431621,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/game-dump/engine/node.lua",
+            "filename": "/Mods/Multiplayer/assets/2x/j_juggler_sandbox.png",
             "crunched": 0,
-            "start": 34676400,
-            "end": 34692575,
+            "start": 36431621,
+            "end": 36450875,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/game-dump/engine/node.lua.json",
+            "filename": "/Mods/Multiplayer/assets/2x/j_lets_go_gambling.png",
             "crunched": 0,
-            "start": 34692575,
-            "end": 34692631,
+            "start": 36450875,
+            "end": 36454860,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/game-dump/engine/save_manager.lua",
+            "filename": "/Mods/Multiplayer/assets/2x/j_loyalty_card_sandbox.png",
             "crunched": 0,
-            "start": 34692631,
-            "end": 34697236,
+            "start": 36454860,
+            "end": 36478122,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/game-dump/engine/save_manager.lua.json",
+            "filename": "/Mods/Multiplayer/assets/2x/j_lucky_cat_sandbox.png",
             "crunched": 0,
-            "start": 34697236,
-            "end": 34697300,
+            "start": 36478122,
+            "end": 36519339,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/game-dump/engine/sound_manager.lua",
+            "filename": "/Mods/Multiplayer/assets/2x/j_magnet.png",
             "crunched": 0,
-            "start": 34697300,
-            "end": 34704759,
+            "start": 36519339,
+            "end": 36525511,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/game-dump/engine/sound_manager.lua.json",
+            "filename": "/Mods/Multiplayer/assets/2x/j_mail_sandbox.png",
             "crunched": 0,
-            "start": 34704759,
-            "end": 34704824,
+            "start": 36525511,
+            "end": 36547477,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/game-dump/engine/sprite.lua",
+            "filename": "/Mods/Multiplayer/assets/2x/j_misprint_sandbox.png",
             "crunched": 0,
-            "start": 34704824,
-            "end": 34714418,
+            "start": 36547477,
+            "end": 36569614,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/game-dump/engine/sprite.lua.json",
+            "filename": "/Mods/Multiplayer/assets/2x/j_order_sandbox.png",
             "crunched": 0,
-            "start": 34714418,
-            "end": 34714476,
+            "start": 36569614,
+            "end": 36589986,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/game-dump/engine/string_packer.lua",
+            "filename": "/Mods/Multiplayer/assets/2x/j_pacifist.png",
             "crunched": 0,
-            "start": 34714476,
-            "end": 34717562,
+            "start": 36589986,
+            "end": 36592487,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/game-dump/engine/string_packer.lua.json",
+            "filename": "/Mods/Multiplayer/assets/2x/j_penny_pincher.png",
             "crunched": 0,
-            "start": 34717562,
-            "end": 34717627,
+            "start": 36592487,
+            "end": 36595288,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/game-dump/engine/text.lua",
+            "filename": "/Mods/Multiplayer/assets/2x/j_photograph_sandbox.png",
             "crunched": 0,
-            "start": 34717627,
-            "end": 34739909,
+            "start": 36595288,
+            "end": 36620647,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/game-dump/engine/text.lua.json",
+            "filename": "/Mods/Multiplayer/assets/2x/j_pizza.png",
             "crunched": 0,
-            "start": 34739909,
-            "end": 34739965,
+            "start": 36620647,
+            "end": 36624654,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/game-dump/engine/ui.lua",
+            "filename": "/Mods/Multiplayer/assets/2x/j_ride_the_bus_sandbox.png",
             "crunched": 0,
-            "start": 34739965,
-            "end": 34790044,
+            "start": 36624654,
+            "end": 36630093,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/game-dump/engine/ui.lua.json",
+            "filename": "/Mods/Multiplayer/assets/2x/j_runner_sandbox.png",
             "crunched": 0,
-            "start": 34790044,
-            "end": 34790098,
+            "start": 36630093,
+            "end": 36645000,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/game-dump/functions/button_callbacks.lua",
+            "filename": "/Mods/Multiplayer/assets/2x/j_satellite_sandbox.png",
             "crunched": 0,
-            "start": 34790098,
-            "end": 34915041,
+            "start": 36645000,
+            "end": 36661082,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/game-dump/functions/button_callbacks.lua.json",
+            "filename": "/Mods/Multiplayer/assets/2x/j_skip_off.png",
             "crunched": 0,
-            "start": 34915041,
-            "end": 34915112,
+            "start": 36661082,
+            "end": 36663258,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/game-dump/functions/common_events.lua",
+            "filename": "/Mods/Multiplayer/assets/2x/j_speedrun.png",
             "crunched": 0,
-            "start": 34915112,
-            "end": 35117215,
+            "start": 36663258,
+            "end": 36664542,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/game-dump/functions/common_events.lua.json",
+            "filename": "/Mods/Multiplayer/assets/2x/j_square_sandbox.png",
             "crunched": 0,
-            "start": 35117215,
-            "end": 35117283,
+            "start": 36664542,
+            "end": 36673895,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/game-dump/functions/misc_functions.lua",
+            "filename": "/Mods/Multiplayer/assets/2x/j_steel_joker_sandbox.png",
             "crunched": 0,
-            "start": 35117283,
-            "end": 35199948,
+            "start": 36673895,
+            "end": 36687104,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/game-dump/functions/misc_functions.lua.json",
+            "filename": "/Mods/Multiplayer/assets/2x/j_taxes.png",
             "crunched": 0,
-            "start": 35199948,
-            "end": 35200017,
+            "start": 36687104,
+            "end": 36691197,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/game-dump/functions/state_events.lua",
+            "filename": "/Mods/Multiplayer/assets/2x/j_throwback_sandbox.png",
             "crunched": 0,
-            "start": 35200017,
-            "end": 35284096,
+            "start": 36691197,
+            "end": 36714686,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/game-dump/functions/state_events.lua.json",
+            "filename": "/Mods/Multiplayer/assets/2x/j_vampire_sandbox.png",
             "crunched": 0,
-            "start": 35284096,
-            "end": 35284163,
+            "start": 36714686,
+            "end": 36731994,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/game-dump/functions/UI_definitions.lua",
+            "filename": "/Mods/Multiplayer/assets/2x/modicon.png",
             "crunched": 0,
-            "start": 35284163,
-            "end": 35663696,
+            "start": 36731994,
+            "end": 36732697,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/game-dump/functions/UI_definitions.lua.json",
+            "filename": "/Mods/Multiplayer/assets/2x/player_blind_row.png",
             "crunched": 0,
-            "start": 35663696,
-            "end": 35663765,
+            "start": 36732697,
+            "end": 36736975,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/game-dump/game.lua",
+            "filename": "/Mods/Multiplayer/assets/2x/release_jokers.png",
             "crunched": 0,
-            "start": 35663765,
-            "end": 35918975,
+            "start": 36736975,
+            "end": 37601885,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/game-dump/game.lua.json",
+            "filename": "/Mods/Multiplayer/assets/2x/stakes-chips.png",
             "crunched": 0,
-            "start": 35918975,
-            "end": 35919024,
+            "start": 37601885,
+            "end": 37610660,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/game-dump/globals.lua",
+            "filename": "/Mods/Multiplayer/assets/2x/standard_giga.png",
             "crunched": 0,
-            "start": 35919024,
-            "end": 35940987,
+            "start": 37610660,
+            "end": 37619098,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/game-dump/globals.lua.json",
+            "filename": "/Mods/Multiplayer/assets/2x/sticker_balanced.png",
             "crunched": 0,
-            "start": 35940987,
-            "end": 35941039,
+            "start": 37619098,
+            "end": 37620117,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/game-dump/lovely/SMODS/preflight/core/src/preflight/core.lua",
+            "filename": "/Mods/Multiplayer/assets/2x/sticker_nemesis.png",
             "crunched": 0,
-            "start": 35941039,
-            "end": 35946628,
+            "start": 37620117,
+            "end": 37621009,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/game-dump/lovely/SMODS/preflight/core/src/preflight/core.lua.json",
+            "filename": "/Mods/Multiplayer/assets/2x/tag_gambling_sandbox.png",
             "crunched": 0,
-            "start": 35946628,
-            "end": 35946725,
+            "start": 37621009,
+            "end": 37621712,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/game-dump/main.lua",
+            "filename": "/Mods/Multiplayer/CHANGELOG.md",
             "crunched": 0,
-            "start": 35946725,
-            "end": 36059597,
+            "start": 37621712,
+            "end": 37623834,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/game-dump/main.lua.json",
+            "filename": "/Mods/Multiplayer/compatibility/_compatibility.lua",
             "crunched": 0,
-            "start": 36059597,
-            "end": 36059646,
+            "start": 37623834,
+            "end": 37625829,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/game-dump/SMODS/_/src/card_draw.lua",
+            "filename": "/Mods/Multiplayer/compatibility/AntePreview.lua",
             "crunched": 0,
-            "start": 36059646,
-            "end": 36087957,
+            "start": 37625829,
+            "end": 37626220,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/game-dump/SMODS/_/src/card_draw.lua.json",
+            "filename": "/Mods/Multiplayer/compatibility/CodexArcanum.lua",
             "crunched": 0,
-            "start": 36087957,
-            "end": 36088029,
+            "start": 37626220,
+            "end": 37626446,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/game-dump/SMODS/_/src/game_object.lua",
+            "filename": "/Mods/Multiplayer/compatibility/Cryptid.lua",
             "crunched": 0,
-            "start": 36088029,
-            "end": 36260605,
+            "start": 37626446,
+            "end": 37628347,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/game-dump/SMODS/_/src/game_object.lua.json",
+            "filename": "/Mods/Multiplayer/compatibility/Distro.lua",
             "crunched": 0,
-            "start": 36260605,
-            "end": 36260679,
+            "start": 37628347,
+            "end": 37631083,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/game-dump/SMODS/_/src/overrides.lua",
+            "filename": "/Mods/Multiplayer/compatibility/ExtraCredit.lua",
             "crunched": 0,
-            "start": 36260679,
-            "end": 36378004,
+            "start": 37631083,
+            "end": 37631282,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/game-dump/SMODS/_/src/overrides.lua.json",
+            "filename": "/Mods/Multiplayer/compatibility/Handy.lua",
             "crunched": 0,
-            "start": 36378004,
-            "end": 36378076,
+            "start": 37631282,
+            "end": 37636424,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/game-dump/SMODS/_/src/ui.lua",
+            "filename": "/Mods/Multiplayer/compatibility/HotPotato.lua",
             "crunched": 0,
-            "start": 36378076,
-            "end": 36510620,
+            "start": 37636424,
+            "end": 37640237,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/game-dump/SMODS/_/src/ui.lua.json",
+            "filename": "/Mods/Multiplayer/compatibility/Jen.lua",
             "crunched": 0,
-            "start": 36510620,
-            "end": 36510685,
+            "start": 37640237,
+            "end": 37640508,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/game-dump/SMODS/_/src/utils.lua",
+            "filename": "/Mods/Multiplayer/compatibility/JokerDisplay.lua",
             "crunched": 0,
-            "start": 36510685,
-            "end": 36683393,
+            "start": 37640508,
+            "end": 37649370,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/game-dump/SMODS/_/src/utils.lua.json",
+            "filename": "/Mods/Multiplayer/compatibility/Ortalab.lua",
             "crunched": 0,
-            "start": 36683393,
-            "end": 36683461,
+            "start": 37649370,
+            "end": 37649674,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/game-dump/SMODS/Cryptid/items/code.lua",
+            "filename": "/Mods/Multiplayer/compatibility/Pokermon.lua",
             "crunched": 0,
-            "start": 36683461,
-            "end": 36840741,
+            "start": 37649674,
+            "end": 37649921,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/game-dump/SMODS/Cryptid/items/code.lua.json",
+            "filename": "/Mods/Multiplayer/compatibility/Preview/CorePreview.lua",
             "crunched": 0,
-            "start": 36840741,
-            "end": 36840816,
+            "start": 37649921,
+            "end": 37659291,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/game-dump/tag.lua",
+            "filename": "/Mods/Multiplayer/compatibility/Preview/EngineSimulate.lua",
             "crunched": 0,
-            "start": 36840816,
-            "end": 36872167,
+            "start": 37659291,
+            "end": 37675849,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/game-dump/tag.lua.json",
+            "filename": "/Mods/Multiplayer/compatibility/Preview/InitPreview.lua",
             "crunched": 0,
-            "start": 36872167,
-            "end": 36872215,
+            "start": 37675849,
+            "end": 37680082,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.09-20.40.18.log",
+            "filename": "/Mods/Multiplayer/compatibility/Preview/InitSimulate.lua",
             "crunched": 0,
-            "start": 36872215,
-            "end": 36872571,
+            "start": 37680082,
+            "end": 37681094,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.09-20.40.51.log",
+            "filename": "/Mods/Multiplayer/compatibility/Preview/InterfacePreview.lua",
             "crunched": 0,
-            "start": 36872571,
-            "end": 36875350,
+            "start": 37681094,
+            "end": 37686040,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.09-20.41.18.log",
+            "filename": "/Mods/Multiplayer/compatibility/Preview/Jokers/_Vanilla.lua",
             "crunched": 0,
-            "start": 36875350,
-            "end": 36887467,
+            "start": 37686040,
+            "end": 37721889,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.09-20.42.50.log",
+            "filename": "/Mods/Multiplayer/compatibility/Preview/Jokers/Multiplayer.lua",
             "crunched": 0,
-            "start": 36887467,
-            "end": 36899515,
+            "start": 37721889,
+            "end": 37724267,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.09-20.44.17.log",
+            "filename": "/Mods/Multiplayer/compatibility/Preview/UtilsPreview.lua",
             "crunched": 0,
-            "start": 36899515,
-            "end": 36907125,
+            "start": 37724267,
+            "end": 37725135,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.09-20.47.04.log",
+            "filename": "/Mods/Multiplayer/compatibility/Preview/UtilsSimulate.lua",
             "crunched": 0,
-            "start": 36907125,
-            "end": 36916476,
+            "start": 37725135,
+            "end": 37732362,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.09-21.48.42.log",
+            "filename": "/Mods/Multiplayer/compatibility/StrangePencil.lua",
             "crunched": 0,
-            "start": 36916476,
-            "end": 36925743,
+            "start": 37732362,
+            "end": 37732989,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.09-21.48.59.log",
+            "filename": "/Mods/Multiplayer/compatibility/Talisman.lua",
             "crunched": 0,
-            "start": 36925743,
-            "end": 36935002,
+            "start": 37732989,
+            "end": 37733037,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.09-21.53.01.log",
+            "filename": "/Mods/Multiplayer/compatibility/TheOrder.lua",
             "crunched": 0,
-            "start": 36935002,
-            "end": 36944262,
+            "start": 37733037,
+            "end": 37757283,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.09-22.09.52.log",
+            "filename": "/Mods/Multiplayer/compatibility/TooManyJokers.lua",
             "crunched": 0,
-            "start": 36944262,
-            "end": 36970713,
+            "start": 37757283,
+            "end": 37757691,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.09-22.14.35.log",
+            "filename": "/Mods/Multiplayer/compatibility/UpgradeMod.lua",
             "crunched": 0,
-            "start": 36970713,
-            "end": 36997160,
+            "start": 37757691,
+            "end": 37758552,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.09-22.16.36.log",
+            "filename": "/Mods/Multiplayer/config.lua",
             "crunched": 0,
-            "start": 36997160,
-            "end": 37023610,
+            "start": 37758552,
+            "end": 37758916,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.09-22.17.34.log",
+            "filename": "/Mods/Multiplayer/CONTRIBUTING.md",
             "crunched": 0,
-            "start": 37023610,
-            "end": 37050061,
+            "start": 37758916,
+            "end": 37763149,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.09-22.18.20.log",
+            "filename": "/Mods/Multiplayer/core.lua",
             "crunched": 0,
-            "start": 37050061,
-            "end": 37076515,
+            "start": 37763149,
+            "end": 37772448,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.09-22.21.50.log",
+            "filename": "/Mods/Multiplayer/gamemodes/_gamemodes.lua",
             "crunched": 0,
-            "start": 37076515,
-            "end": 37102962,
+            "start": 37772448,
+            "end": 37773354,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.09-22.24.37.log",
+            "filename": "/Mods/Multiplayer/gamemodes/attrition.lua",
             "crunched": 0,
-            "start": 37102962,
-            "end": 37129409,
+            "start": 37773354,
+            "end": 37777638,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.09-22.25.26.log",
+            "filename": "/Mods/Multiplayer/gamemodes/showdown.lua",
             "crunched": 0,
-            "start": 37129409,
-            "end": 37155856,
+            "start": 37777638,
+            "end": 37781847,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.09-22.27.55.log",
+            "filename": "/Mods/Multiplayer/gamemodes/survival.lua",
             "crunched": 0,
-            "start": 37155856,
-            "end": 37182311,
+            "start": 37781847,
+            "end": 37784608,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.09-22.29.59.log",
+            "filename": "/Mods/Multiplayer/layers/_layers.lua",
             "crunched": 0,
-            "start": 37182311,
-            "end": 37209042,
+            "start": 37784608,
+            "end": 37793650,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.09-22.30.10.log",
+            "filename": "/Mods/Multiplayer/layers/ban_mutators.lua",
             "crunched": 0,
-            "start": 37209042,
-            "end": 37235772,
+            "start": 37793650,
+            "end": 37794301,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.09-22.31.32.log",
+            "filename": "/Mods/Multiplayer/layers/classic.lua",
             "crunched": 0,
-            "start": 37235772,
-            "end": 37262503,
+            "start": 37794301,
+            "end": 37794400,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.09-22.35.25.log",
+            "filename": "/Mods/Multiplayer/layers/economy_mutators.lua",
             "crunched": 0,
-            "start": 37262503,
-            "end": 37289241,
+            "start": 37794400,
+            "end": 37795468,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.09-22.36.59.log",
+            "filename": "/Mods/Multiplayer/layers/eeeee.lua",
             "crunched": 0,
-            "start": 37289241,
-            "end": 37298508,
+            "start": 37795468,
+            "end": 37796344,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.09-22.37.18.log",
+            "filename": "/Mods/Multiplayer/layers/esoteric_mutators.lua",
             "crunched": 0,
-            "start": 37298508,
-            "end": 37313517,
+            "start": 37796344,
+            "end": 37796743,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.09-22.37.54.log",
+            "filename": "/Mods/Multiplayer/layers/experimental.lua",
             "crunched": 0,
-            "start": 37313517,
-            "end": 37328156,
+            "start": 37796743,
+            "end": 37798754,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.09-22.38.56.log",
+            "filename": "/Mods/Multiplayer/layers/glass_cannon.lua",
             "crunched": 0,
-            "start": 37328156,
-            "end": 37354599,
+            "start": 37798754,
+            "end": 37799542,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.09-22.42.49.log",
+            "filename": "/Mods/Multiplayer/layers/glass_variants.lua",
             "crunched": 0,
-            "start": 37354599,
-            "end": 37381046,
+            "start": 37799542,
+            "end": 37799752,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.09-22.45.38.log",
+            "filename": "/Mods/Multiplayer/layers/mutator_stubs.lua",
             "crunched": 0,
-            "start": 37381046,
-            "end": 37405763,
+            "start": 37799752,
+            "end": 37800006,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.09-22.46.06.log",
+            "filename": "/Mods/Multiplayer/layers/no_anim_timer.lua",
             "crunched": 0,
-            "start": 37405763,
-            "end": 37430477,
+            "start": 37800006,
+            "end": 37800144,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.09-22.46.50.log",
+            "filename": "/Mods/Multiplayer/layers/no_red_seals.lua",
             "crunched": 0,
-            "start": 37430477,
-            "end": 37455183,
+            "start": 37800144,
+            "end": 37801090,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.09-22.49.39.log",
+            "filename": "/Mods/Multiplayer/layers/polymorph_spam.lua",
             "crunched": 0,
-            "start": 37455183,
-            "end": 37479894,
+            "start": 37801090,
+            "end": 37805269,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.09-22.56.15.log",
+            "filename": "/Mods/Multiplayer/layers/pressure_timer.lua",
             "crunched": 0,
-            "start": 37479894,
-            "end": 37504604,
+            "start": 37805269,
+            "end": 37805801,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.09-23.05.04.log",
+            "filename": "/Mods/Multiplayer/layers/pvp_timer.lua",
             "crunched": 0,
-            "start": 37504604,
-            "end": 37529614,
+            "start": 37805801,
+            "end": 37805905,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.10-15.56.18.log",
+            "filename": "/Mods/Multiplayer/layers/ranked.lua",
             "crunched": 0,
-            "start": 37529614,
-            "end": 37554627,
+            "start": 37805905,
+            "end": 37806166,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.10-16.02.31.log",
+            "filename": "/Mods/Multiplayer/layers/release.lua",
             "crunched": 0,
-            "start": 37554627,
-            "end": 37579639,
+            "start": 37806166,
+            "end": 37806257,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.10-16.05.44.log",
+            "filename": "/Mods/Multiplayer/layers/sandbox.lua",
             "crunched": 0,
-            "start": 37579639,
-            "end": 37604648,
+            "start": 37806257,
+            "end": 37814995,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.10-16.08.24.log",
+            "filename": "/Mods/Multiplayer/layers/score_instability.lua",
             "crunched": 0,
-            "start": 37604648,
-            "end": 37629657,
+            "start": 37814995,
+            "end": 37817042,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.10-16.18.41.log",
+            "filename": "/Mods/Multiplayer/layers/shared_pockets.lua",
             "crunched": 0,
-            "start": 37629657,
-            "end": 37654768,
+            "start": 37817042,
+            "end": 37819685,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.10-16.24.13.log",
+            "filename": "/Mods/Multiplayer/layers/shop_mutators.lua",
             "crunched": 0,
-            "start": 37654768,
-            "end": 37679655,
+            "start": 37819685,
+            "end": 37819770,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.10-16.27.53.log",
+            "filename": "/Mods/Multiplayer/layers/smallworld.lua",
             "crunched": 0,
-            "start": 37679655,
-            "end": 37704535,
+            "start": 37819770,
+            "end": 37824877,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.10-16.31.40.log",
+            "filename": "/Mods/Multiplayer/layers/speedlatro_timer.lua",
             "crunched": 0,
-            "start": 37704535,
-            "end": 37729414,
+            "start": 37824877,
+            "end": 37830109,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.10-16.37.17.log",
+            "filename": "/Mods/Multiplayer/layers/standard.lua",
             "crunched": 0,
-            "start": 37729414,
-            "end": 37754295,
+            "start": 37830109,
+            "end": 37830665,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.10-16.41.14.log",
+            "filename": "/Mods/Multiplayer/layers/wraith_rework.lua",
             "crunched": 0,
-            "start": 37754295,
-            "end": 37779172,
+            "start": 37830665,
+            "end": 37830859,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.10-16.45.16.log",
+            "filename": "/Mods/Multiplayer/lib/_init.lua",
             "crunched": 0,
-            "start": 37779172,
-            "end": 37804053,
+            "start": 37830859,
+            "end": 37830873,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.10-16.46.05.log",
+            "filename": "/Mods/Multiplayer/lib/_table_utils.lua",
             "crunched": 0,
-            "start": 37804053,
-            "end": 37828936,
+            "start": 37830873,
+            "end": 37832447,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.10-16.47.19.log",
+            "filename": "/Mods/Multiplayer/lib/blind_utils.lua",
             "crunched": 0,
-            "start": 37828936,
-            "end": 37853813,
+            "start": 37832447,
+            "end": 37833071,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.10-16.48.04.log",
+            "filename": "/Mods/Multiplayer/lib/card_utils.lua",
             "crunched": 0,
-            "start": 37853813,
-            "end": 37878693,
+            "start": 37833071,
+            "end": 37839855,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.10-16.48.55.log",
+            "filename": "/Mods/Multiplayer/lib/crypto.lua",
             "crunched": 0,
-            "start": 37878693,
-            "end": 37903569,
+            "start": 37839855,
+            "end": 37842023,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.10-16.49.53.log",
+            "filename": "/Mods/Multiplayer/lib/debug_utils.lua",
             "crunched": 0,
-            "start": 37903569,
-            "end": 37928452,
+            "start": 37842023,
+            "end": 37842771,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.10-16.50.28.log",
+            "filename": "/Mods/Multiplayer/lib/ghost_replay.lua",
             "crunched": 0,
-            "start": 37928452,
-            "end": 37953333,
+            "start": 37842771,
+            "end": 37854988,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.10-17.03.01.log",
+            "filename": "/Mods/Multiplayer/lib/insane_int.lua",
             "crunched": 0,
-            "start": 37953333,
-            "end": 37978217,
+            "start": 37854988,
+            "end": 37859167,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.10-17.43.42.log",
+            "filename": "/Mods/Multiplayer/lib/joker_stats.lua",
             "crunched": 0,
-            "start": 37978217,
-            "end": 38003100,
+            "start": 37859167,
+            "end": 37860438,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.10-17.50.33.log",
+            "filename": "/Mods/Multiplayer/lib/log_parser.lua",
             "crunched": 0,
-            "start": 38003100,
-            "end": 38027977,
+            "start": 37860438,
+            "end": 37873681,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.10-17.56.51.log",
+            "filename": "/Mods/Multiplayer/lib/matchmaking.lua",
             "crunched": 0,
-            "start": 38027977,
-            "end": 38052860,
+            "start": 37873681,
+            "end": 37882779,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.10-18.31.32.log",
+            "filename": "/Mods/Multiplayer/lib/practice_mode.lua",
             "crunched": 0,
-            "start": 38052860,
-            "end": 38078482,
+            "start": 37882779,
+            "end": 37884869,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.10-18.32.09.log",
+            "filename": "/Mods/Multiplayer/lib/replay_log.lua",
             "crunched": 0,
-            "start": 38078482,
-            "end": 38096489,
+            "start": 37884869,
+            "end": 37894394,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.10-18.33.20.log",
+            "filename": "/Mods/Multiplayer/lib/ruleset_utils.lua",
             "crunched": 0,
-            "start": 38096489,
-            "end": 38105711,
+            "start": 37894394,
+            "end": 37896536,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.10-18.33.29.log",
+            "filename": "/Mods/Multiplayer/lib/serialization.lua",
             "crunched": 0,
-            "start": 38105711,
-            "end": 38114849,
+            "start": 37896536,
+            "end": 37899335,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.10-18.38.17.log",
+            "filename": "/Mods/Multiplayer/lib/settings_utils.lua",
             "crunched": 0,
-            "start": 38114849,
-            "end": 38125726,
+            "start": 37899335,
+            "end": 37899335,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.18-18.00.22.log",
+            "filename": "/Mods/Multiplayer/lib/string_utils.lua",
             "crunched": 0,
-            "start": 38125726,
-            "end": 38145836,
+            "start": 37899335,
+            "end": 37900119,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.18-20.50.43.log",
+            "filename": "/Mods/Multiplayer/lib/ui.lua",
             "crunched": 0,
-            "start": 38145836,
-            "end": 38155290,
+            "start": 37900119,
+            "end": 37903173,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.18-22.17.21.log",
+            "filename": "/Mods/Multiplayer/LICENSE.md",
             "crunched": 0,
-            "start": 38155290,
-            "end": 38175172,
+            "start": 37903173,
+            "end": 37938322,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.19-10.48.04.log",
+            "filename": "/Mods/Multiplayer/localization/de.lua",
             "crunched": 0,
-            "start": 38175172,
-            "end": 38195053,
+            "start": 37938322,
+            "end": 37947340,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.19-13.54.06.log",
+            "filename": "/Mods/Multiplayer/localization/en-us.lua",
             "crunched": 0,
-            "start": 38195053,
-            "end": 38204507,
+            "start": 37947340,
+            "end": 37998449,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.19-18.04.58.log",
+            "filename": "/Mods/Multiplayer/localization/es_419.lua",
             "crunched": 0,
-            "start": 38204507,
-            "end": 38213961,
+            "start": 37998449,
+            "end": 38034603,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.19-20.28.32.log",
+            "filename": "/Mods/Multiplayer/localization/es_ES.lua",
             "crunched": 0,
-            "start": 38213961,
-            "end": 38223412,
+            "start": 38034603,
+            "end": 38047387,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.19-20.34.31.log",
+            "filename": "/Mods/Multiplayer/localization/fr.lua",
             "crunched": 0,
-            "start": 38223412,
-            "end": 38232866,
+            "start": 38047387,
+            "end": 38061136,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.19-22.15.51.log",
+            "filename": "/Mods/Multiplayer/localization/it.lua",
             "crunched": 0,
-            "start": 38232866,
-            "end": 38242452,
+            "start": 38061136,
+            "end": 38088929,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.20-10.52.33.log",
+            "filename": "/Mods/Multiplayer/localization/ja.lua",
             "crunched": 0,
-            "start": 38242452,
-            "end": 38253336,
+            "start": 38088929,
+            "end": 38123185,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.20-10.54.12.log",
+            "filename": "/Mods/Multiplayer/localization/ko.lua",
             "crunched": 0,
-            "start": 38253336,
-            "end": 38264176,
+            "start": 38123185,
+            "end": 38156591,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.20-10.58.42.log",
+            "filename": "/Mods/Multiplayer/localization/mi.lua",
             "crunched": 0,
-            "start": 38264176,
-            "end": 38275140,
+            "start": 38156591,
+            "end": 38166719,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.20-14.26.09.log",
+            "filename": "/Mods/Multiplayer/localization/nl.lua",
             "crunched": 0,
-            "start": 38275140,
-            "end": 38280164,
+            "start": 38166719,
+            "end": 38180319,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.20-14.27.31.log",
+            "filename": "/Mods/Multiplayer/localization/pl.lua",
             "crunched": 0,
-            "start": 38280164,
-            "end": 38296995,
+            "start": 38180319,
+            "end": 38193218,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.20-14.43.35.log",
+            "filename": "/Mods/Multiplayer/localization/pt_BR.lua",
             "crunched": 0,
-            "start": 38296995,
-            "end": 38487505,
+            "start": 38193218,
+            "end": 38208202,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.20-15.16.09.log",
+            "filename": "/Mods/Multiplayer/localization/ru.lua",
             "crunched": 0,
-            "start": 38487505,
-            "end": 39470889,
+            "start": 38208202,
+            "end": 38277238,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.20-20.32.11.log",
+            "filename": "/Mods/Multiplayer/localization/stylua.toml",
             "crunched": 0,
-            "start": 39470889,
-            "end": 39514549,
+            "start": 38277238,
+            "end": 38277372,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.20-20.41.29.log",
+            "filename": "/Mods/Multiplayer/localization/vi.lua",
             "crunched": 0,
-            "start": 39514549,
-            "end": 40208907,
+            "start": 38277372,
+            "end": 38323015,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.21-16.41.30.log",
+            "filename": "/Mods/Multiplayer/localization/zh_CN.lua",
             "crunched": 0,
-            "start": 40208907,
-            "end": 40218038,
+            "start": 38323015,
+            "end": 38340406,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.21-16.41.40.log",
+            "filename": "/Mods/Multiplayer/localization/zh_TW.lua",
             "crunched": 0,
-            "start": 40218038,
-            "end": 40227168,
+            "start": 38340406,
+            "end": 38343328,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.21-16.42.37.log",
+            "filename": "/Mods/Multiplayer/lovely/cards.toml",
             "crunched": 0,
-            "start": 40227168,
-            "end": 40243035,
+            "start": 38343328,
+            "end": 38345915,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.21-17.46.10.log",
+            "filename": "/Mods/Multiplayer/lovely/ce.toml",
             "crunched": 0,
-            "start": 40243035,
-            "end": 40256672,
+            "start": 38345915,
+            "end": 38346882,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.21-17.48.12.log",
+            "filename": "/Mods/Multiplayer/lovely/challenges.toml",
             "crunched": 0,
-            "start": 40256672,
-            "end": 40267986,
+            "start": 38346882,
+            "end": 38347716,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.21-20.34.21.log",
+            "filename": "/Mods/Multiplayer/lovely/compatibility.toml",
             "crunched": 0,
-            "start": 40267986,
-            "end": 40279300,
+            "start": 38347716,
+            "end": 38348327,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.21-20.37.25.log",
+            "filename": "/Mods/Multiplayer/lovely/deck_select.toml",
             "crunched": 0,
-            "start": 40279300,
-            "end": 40290622,
+            "start": 38348327,
+            "end": 38351153,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.21-20.42.17.log",
+            "filename": "/Mods/Multiplayer/lovely/decks.toml",
             "crunched": 0,
-            "start": 40290622,
-            "end": 40301937,
+            "start": 38351153,
+            "end": 38352110,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.21-20.46.00.log",
+            "filename": "/Mods/Multiplayer/lovely/double_emplace.toml",
             "crunched": 0,
-            "start": 40301937,
-            "end": 40313252,
+            "start": 38352110,
+            "end": 38353382,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.21-20.50.36.log",
+            "filename": "/Mods/Multiplayer/lovely/end_round.toml",
             "crunched": 0,
-            "start": 40313252,
-            "end": 40324567,
+            "start": 38353382,
+            "end": 38358732,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.21-20.54.50.log",
+            "filename": "/Mods/Multiplayer/lovely/game.toml",
             "crunched": 0,
-            "start": 40324567,
-            "end": 40336134,
+            "start": 38358732,
+            "end": 38364307,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.21-20.58.05.log",
+            "filename": "/Mods/Multiplayer/lovely/hud.toml",
             "crunched": 0,
-            "start": 40336134,
-            "end": 40347448,
+            "start": 38364307,
+            "end": 38367475,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.21-21.02.14.log",
+            "filename": "/Mods/Multiplayer/lovely/misc.toml",
             "crunched": 0,
-            "start": 40347448,
-            "end": 40358763,
+            "start": 38367475,
+            "end": 38374011,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.21-21.05.36.log",
+            "filename": "/Mods/Multiplayer/lovely/pause.toml",
             "crunched": 0,
-            "start": 40358763,
-            "end": 40370077,
+            "start": 38374011,
+            "end": 38375761,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.21-21.10.50.log",
+            "filename": "/Mods/Multiplayer/lovely/practice.toml",
             "crunched": 0,
-            "start": 40370077,
-            "end": 40381392,
+            "start": 38375761,
+            "end": 38378761,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.21-21.16.57.log",
+            "filename": "/Mods/Multiplayer/lovely/preview.toml",
             "crunched": 0,
-            "start": 40381392,
-            "end": 40392714,
+            "start": 38378761,
+            "end": 38379690,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.21-21.21.15.log",
+            "filename": "/Mods/Multiplayer/lovely/rework-center.toml",
             "crunched": 0,
-            "start": 40392714,
-            "end": 40404036,
+            "start": 38379690,
+            "end": 38381035,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.21-21.26.38.log",
+            "filename": "/Mods/Multiplayer/lovely/shared_area.toml",
             "crunched": 0,
-            "start": 40404036,
-            "end": 40415351,
+            "start": 38381035,
+            "end": 38381885,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.21-21.31.59.log",
+            "filename": "/Mods/Multiplayer/lovely/stakes.toml",
             "crunched": 0,
-            "start": 40415351,
-            "end": 40426666,
+            "start": 38381885,
+            "end": 38384211,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.21-21.40.41.log",
+            "filename": "/Mods/Multiplayer/lovely/TheOrder.toml",
             "crunched": 0,
-            "start": 40426666,
-            "end": 40437987,
+            "start": 38384211,
+            "end": 38392126,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.21-21.44.53.log",
+            "filename": "/Mods/Multiplayer/lovely/timer.toml",
             "crunched": 0,
-            "start": 40437987,
-            "end": 40445381,
+            "start": 38392126,
+            "end": 38392636,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.21-21.45.37.log",
+            "filename": "/Mods/Multiplayer/lovely/view_deck.toml",
             "crunched": 0,
-            "start": 40445381,
-            "end": 40452775,
+            "start": 38392636,
+            "end": 38393553,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.21-21.47.04.log",
+            "filename": "/Mods/Multiplayer/Multiplayer.json",
             "crunched": 0,
-            "start": 40452775,
-            "end": 40460169,
+            "start": 38393553,
+            "end": 38394183,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.21-21.48.17.log",
+            "filename": "/Mods/Multiplayer/networking/action_handlers.lua",
             "crunched": 0,
-            "start": 40460169,
-            "end": 40467562,
+            "start": 38394183,
+            "end": 38441064,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.21-21.51.54.log",
+            "filename": "/Mods/Multiplayer/networking/socket.lua",
             "crunched": 0,
-            "start": 40467562,
-            "end": 40478884,
+            "start": 38441064,
+            "end": 38447564,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.21-21.57.17.log",
+            "filename": "/Mods/Multiplayer/objects/blinds/nemesis.lua",
             "crunched": 0,
-            "start": 40478884,
-            "end": 40490199,
+            "start": 38447564,
+            "end": 38448317,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.21-21.58.38.log",
+            "filename": "/Mods/Multiplayer/objects/boosters/standard_giga.lua",
             "crunched": 0,
-            "start": 40490199,
-            "end": 40501521,
+            "start": 38448317,
+            "end": 38449502,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.21-22.01.38.log",
+            "filename": "/Mods/Multiplayer/objects/challenges/all_must_go.lua",
             "crunched": 0,
-            "start": 40501521,
-            "end": 40512843,
+            "start": 38449502,
+            "end": 38449690,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.21-22.03.16.log",
+            "filename": "/Mods/Multiplayer/objects/challenges/bacon.lua",
             "crunched": 0,
-            "start": 40512843,
-            "end": 40524164,
+            "start": 38449690,
+            "end": 38450832,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.21-22.17.01.log",
+            "filename": "/Mods/Multiplayer/objects/challenges/balancing_act.lua",
             "crunched": 0,
-            "start": 40524164,
-            "end": 40535486,
+            "start": 38450832,
+            "end": 38451339,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.21-22.18.28.log",
+            "filename": "/Mods/Multiplayer/objects/challenges/chore_list.lua",
             "crunched": 0,
-            "start": 40535486,
-            "end": 40546807,
+            "start": 38451339,
+            "end": 38452124,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.21-22.21.36.log",
+            "filename": "/Mods/Multiplayer/objects/challenges/divination.lua",
             "crunched": 0,
-            "start": 40546807,
-            "end": 40558122,
+            "start": 38452124,
+            "end": 38452270,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.21-22.34.46.log",
+            "filename": "/Mods/Multiplayer/objects/challenges/eeeee.lua",
             "crunched": 0,
-            "start": 40558122,
-            "end": 40569443,
+            "start": 38452270,
+            "end": 38452496,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.21-22.38.01.log",
+            "filename": "/Mods/Multiplayer/objects/challenges/high_hand.lua",
             "crunched": 0,
-            "start": 40569443,
-            "end": 40580758,
+            "start": 38452496,
+            "end": 38452795,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.21-22.39.23.log",
+            "filename": "/Mods/Multiplayer/objects/challenges/in_the_red.lua",
             "crunched": 0,
-            "start": 40580758,
-            "end": 40592080,
+            "start": 38452795,
+            "end": 38453189,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.21-22.47.29.log",
+            "filename": "/Mods/Multiplayer/objects/challenges/legendaries.lua",
             "crunched": 0,
-            "start": 40592080,
-            "end": 40603394,
+            "start": 38453189,
+            "end": 38453804,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.21-22.52.21.log",
+            "filename": "/Mods/Multiplayer/objects/challenges/lets_go_gambling.lua",
             "crunched": 0,
-            "start": 40603394,
-            "end": 40614709,
+            "start": 38453804,
+            "end": 38454805,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.21-22.53.45.log",
+            "filename": "/Mods/Multiplayer/objects/challenges/misprint_deck.lua",
             "crunched": 0,
-            "start": 40614709,
-            "end": 40626024,
+            "start": 38454805,
+            "end": 38455042,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.21-22.56.44.log",
+            "filename": "/Mods/Multiplayer/objects/challenges/oops_all_jokers.lua",
             "crunched": 0,
-            "start": 40626024,
-            "end": 40637339,
+            "start": 38455042,
+            "end": 38456244,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.21-22.58.04.log",
+            "filename": "/Mods/Multiplayer/objects/challenges/planet_tycoon.lua",
             "crunched": 0,
-            "start": 40637339,
-            "end": 40644724,
+            "start": 38456244,
+            "end": 38456645,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.21-23.02.36.log",
+            "filename": "/Mods/Multiplayer/objects/challenges/polymorph_spam.lua",
             "crunched": 0,
-            "start": 40644724,
-            "end": 40656046,
+            "start": 38456645,
+            "end": 38457318,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.21-23.05.59.log",
+            "filename": "/Mods/Multiplayer/objects/challenges/psychosis.lua",
             "crunched": 0,
-            "start": 40656046,
-            "end": 40667367,
+            "start": 38457318,
+            "end": 38457462,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.23-15.58.48.log",
+            "filename": "/Mods/Multiplayer/objects/challenges/salvaged_sibyl.lua",
             "crunched": 0,
-            "start": 40667367,
-            "end": 40677208,
+            "start": 38457462,
+            "end": 38459542,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.24-16.34.54.log",
+            "filename": "/Mods/Multiplayer/objects/challenges/scratch.lua",
             "crunched": 0,
-            "start": 40677208,
-            "end": 40688668,
+            "start": 38459542,
+            "end": 38459809,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.24-16.48.36.log",
+            "filename": "/Mods/Multiplayer/objects/challenges/shared_pockets.lua",
             "crunched": 0,
-            "start": 40688668,
-            "end": 40702510,
+            "start": 38459809,
+            "end": 38460183,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.24-16.49.47.log",
+            "filename": "/Mods/Multiplayer/objects/challenges/skip_off.lua",
             "crunched": 0,
-            "start": 40702510,
-            "end": 40716088,
+            "start": 38460183,
+            "end": 38460372,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.24-16.50.08.log",
+            "filename": "/Mods/Multiplayer/objects/challenges/speed.lua",
             "crunched": 0,
-            "start": 40716088,
-            "end": 40729666,
+            "start": 38460372,
+            "end": 38460611,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.24-16.53.19.log",
+            "filename": "/Mods/Multiplayer/objects/challenges/twin_towers.lua",
             "crunched": 0,
-            "start": 40729666,
-            "end": 40741140,
+            "start": 38460611,
+            "end": 38460797,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.24-17.02.41.log",
+            "filename": "/Mods/Multiplayer/objects/challenges/vantablack.lua",
             "crunched": 0,
-            "start": 40741140,
-            "end": 40752614,
+            "start": 38460797,
+            "end": 38461165,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.27-16.37.00.log",
+            "filename": "/Mods/Multiplayer/objects/consumables/asteroid.lua",
             "crunched": 0,
-            "start": 40752614,
-            "end": 40764080,
+            "start": 38461165,
+            "end": 38462615,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.27-16.44.07.log",
+            "filename": "/Mods/Multiplayer/objects/consumables/judgement.lua",
             "crunched": 0,
-            "start": 40764080,
-            "end": 40775553,
+            "start": 38462615,
+            "end": 38465081,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.27-16.46.29.log",
+            "filename": "/Mods/Multiplayer/objects/consumables/ouija.lua",
             "crunched": 0,
-            "start": 40775553,
-            "end": 40787026,
+            "start": 38465081,
+            "end": 38467600,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.27-17.01.40.log",
+            "filename": "/Mods/Multiplayer/objects/consumables/sandbox/ectoplasm.lua",
             "crunched": 0,
-            "start": 40787026,
-            "end": 40798492,
+            "start": 38467600,
+            "end": 38469294,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.27-19.54.18.log",
+            "filename": "/Mods/Multiplayer/objects/consumables/wraith.lua",
             "crunched": 0,
-            "start": 40798492,
-            "end": 40809958,
+            "start": 38469294,
+            "end": 38470200,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.27-20.10.43.log",
+            "filename": "/Mods/Multiplayer/objects/decks/_decks.lua",
             "crunched": 0,
-            "start": 40809958,
-            "end": 40821424,
+            "start": 38470200,
+            "end": 38471230,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.27-20.12.32.log",
+            "filename": "/Mods/Multiplayer/objects/decks/00_violet.lua",
             "crunched": 0,
-            "start": 40821424,
-            "end": 40832890,
+            "start": 38471230,
+            "end": 38472061,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.27-20.17.20.log",
+            "filename": "/Mods/Multiplayer/objects/decks/01_indigo.lua",
             "crunched": 0,
-            "start": 40832890,
-            "end": 40844356,
+            "start": 38472061,
+            "end": 38475116,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.27-20.18.22.log",
+            "filename": "/Mods/Multiplayer/objects/decks/02_orange.lua",
             "crunched": 0,
-            "start": 40844356,
-            "end": 40857925,
+            "start": 38475116,
+            "end": 38476387,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.27-20.21.11.log",
+            "filename": "/Mods/Multiplayer/objects/decks/09_white.lua",
             "crunched": 0,
-            "start": 40857925,
-            "end": 40869391,
+            "start": 38476387,
+            "end": 38477373,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.27-20.38.05.log",
+            "filename": "/Mods/Multiplayer/objects/decks/AA_oracle.lua",
             "crunched": 0,
-            "start": 40869391,
-            "end": 40880857,
+            "start": 38477373,
+            "end": 38478170,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.27-20.40.26.log",
+            "filename": "/Mods/Multiplayer/objects/decks/BB_gradient.lua",
             "crunched": 0,
-            "start": 40880857,
-            "end": 40892891,
+            "start": 38478170,
+            "end": 38483708,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.27-20.43.36.log",
+            "filename": "/Mods/Multiplayer/objects/decks/CC_heidelberg.lua",
             "crunched": 0,
-            "start": 40892891,
-            "end": 40904926,
+            "start": 38483708,
+            "end": 38484428,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.27-20.44.25.log",
+            "filename": "/Mods/Multiplayer/objects/decks/EC_echo_deck.lua",
             "crunched": 0,
-            "start": 40904926,
-            "end": 40916399,
+            "start": 38484428,
+            "end": 38485777,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.27-20.57.57.log",
+            "filename": "/Mods/Multiplayer/objects/decks/ZZ_cocktail.lua",
             "crunched": 0,
-            "start": 40916399,
-            "end": 40927865,
+            "start": 38485777,
+            "end": 38505141,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.27-20.59.33.log",
+            "filename": "/Mods/Multiplayer/objects/editions/phantom.lua",
             "crunched": 0,
-            "start": 40927865,
-            "end": 40939338,
+            "start": 38505141,
+            "end": 38506288,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.30-18.54.20.log",
+            "filename": "/Mods/Multiplayer/objects/enhancements/mp_glass.lua",
             "crunched": 0,
-            "start": 40939338,
-            "end": 40950805,
+            "start": 38506288,
+            "end": 38506495,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.30-19.02.26.log",
+            "filename": "/Mods/Multiplayer/objects/jokers/conjoined_joker.lua",
             "crunched": 0,
-            "start": 40950805,
-            "end": 40960713,
+            "start": 38506495,
+            "end": 38508298,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.30-19.05.22.log",
+            "filename": "/Mods/Multiplayer/objects/jokers/defensive_joker.lua",
             "crunched": 0,
-            "start": 40960713,
-            "end": 40970621,
+            "start": 38508298,
+            "end": 38509695,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.30-19.10.02.log",
+            "filename": "/Mods/Multiplayer/objects/jokers/experimental/baron_uncommon.lua",
             "crunched": 0,
-            "start": 40970621,
-            "end": 40980529,
+            "start": 38509695,
+            "end": 38510422,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.30-19.16.06.log",
+            "filename": "/Mods/Multiplayer/objects/jokers/experimental/idol_rare.lua",
             "crunched": 0,
-            "start": 40980529,
-            "end": 40990444,
+            "start": 38510422,
+            "end": 38511356,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.30-19.22.54.log",
+            "filename": "/Mods/Multiplayer/objects/jokers/experimental/mime_rare.lua",
             "crunched": 0,
-            "start": 40990444,
-            "end": 41000359,
+            "start": 38511356,
+            "end": 38511844,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.30-19.27.27.log",
+            "filename": "/Mods/Multiplayer/objects/jokers/experimental/todo_list.lua",
             "crunched": 0,
-            "start": 41000359,
-            "end": 41010273,
+            "start": 38511844,
+            "end": 38513457,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.30-19.31.00.log",
+            "filename": "/Mods/Multiplayer/objects/jokers/lets_go_gambling.lua",
             "crunched": 0,
-            "start": 41010273,
-            "end": 41020181,
+            "start": 38513457,
+            "end": 38515742,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.30-19.32.04.log",
+            "filename": "/Mods/Multiplayer/objects/jokers/pacifist.lua",
             "crunched": 0,
-            "start": 41020181,
-            "end": 41046541,
+            "start": 38515742,
+            "end": 38516554,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.30-19.36.17.log",
+            "filename": "/Mods/Multiplayer/objects/jokers/penny_pincher.lua",
             "crunched": 0,
-            "start": 41046541,
-            "end": 41056449,
+            "start": 38516554,
+            "end": 38517680,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.30-19.40.27.log",
+            "filename": "/Mods/Multiplayer/objects/jokers/pizza.lua",
             "crunched": 0,
-            "start": 41056449,
-            "end": 41066364,
+            "start": 38517680,
+            "end": 38519382,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.30-19.43.41.log",
+            "filename": "/Mods/Multiplayer/objects/jokers/sandbox/baseball.lua",
             "crunched": 0,
-            "start": 41066364,
-            "end": 41076279,
+            "start": 38519382,
+            "end": 38520234,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.30-19.45.42.log",
+            "filename": "/Mods/Multiplayer/objects/jokers/sandbox/bloodstone.lua",
             "crunched": 0,
-            "start": 41076279,
-            "end": 41086185,
+            "start": 38520234,
+            "end": 38521341,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.30-19.46.59.log",
+            "filename": "/Mods/Multiplayer/objects/jokers/sandbox/castle.lua",
             "crunched": 0,
-            "start": 41086185,
-            "end": 41096093,
+            "start": 38521341,
+            "end": 38522816,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.30-19.53.59.log",
+            "filename": "/Mods/Multiplayer/objects/jokers/sandbox/cloud_9.lua",
             "crunched": 0,
-            "start": 41096093,
-            "end": 41106001,
+            "start": 38522816,
+            "end": 38524528,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.30-19.55.49.log",
+            "filename": "/Mods/Multiplayer/objects/jokers/sandbox/constellation.lua",
             "crunched": 0,
-            "start": 41106001,
-            "end": 41115916,
+            "start": 38524528,
+            "end": 38526143,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.30-19.58.07.log",
+            "filename": "/Mods/Multiplayer/objects/jokers/sandbox/error.lua",
             "crunched": 0,
-            "start": 41115916,
-            "end": 41125824,
+            "start": 38526143,
+            "end": 38530871,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.30-20.05.39.log",
+            "filename": "/Mods/Multiplayer/objects/jokers/sandbox/extra-credit/_ec_atlas.lua",
             "crunched": 0,
-            "start": 41125824,
-            "end": 41135731,
+            "start": 38530871,
+            "end": 38531234,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.30-20.12.27.log",
+            "filename": "/Mods/Multiplayer/objects/jokers/sandbox/extra-credit/_ec_utils.lua",
             "crunched": 0,
-            "start": 41135731,
-            "end": 41145639,
+            "start": 38531234,
+            "end": 38534566,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.30-20.13.35.log",
+            "filename": "/Mods/Multiplayer/objects/jokers/sandbox/extra-credit/alloy.lua",
             "crunched": 0,
-            "start": 41145639,
-            "end": 41155547,
+            "start": 38534566,
+            "end": 38535466,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.30-20.22.22.log",
+            "filename": "/Mods/Multiplayer/objects/jokers/sandbox/extra-credit/ambrosia.lua",
             "crunched": 0,
-            "start": 41155547,
-            "end": 41165455,
+            "start": 38535466,
+            "end": 38537694,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.30-20.24.50.log",
+            "filename": "/Mods/Multiplayer/objects/jokers/sandbox/extra-credit/bobby.lua",
             "crunched": 0,
-            "start": 41165455,
-            "end": 41175363,
+            "start": 38537694,
+            "end": 38539449,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.30-20.28.36.log",
+            "filename": "/Mods/Multiplayer/objects/jokers/sandbox/extra-credit/candynecklace.lua",
             "crunched": 0,
-            "start": 41175363,
-            "end": 41185278,
+            "start": 38539449,
+            "end": 38541256,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.30-20.42.02.log",
+            "filename": "/Mods/Multiplayer/objects/jokers/sandbox/extra-credit/chainlightning.lua",
             "crunched": 0,
-            "start": 41185278,
-            "end": 41195186,
+            "start": 38541256,
+            "end": 38542740,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.30-21.47.08.log",
+            "filename": "/Mods/Multiplayer/objects/jokers/sandbox/extra-credit/clowncar.lua",
             "crunched": 0,
-            "start": 41195186,
-            "end": 41197835,
+            "start": 38542740,
+            "end": 38543738,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.30-21.47.36.log",
+            "filename": "/Mods/Multiplayer/objects/jokers/sandbox/extra-credit/clowncollege.lua",
             "crunched": 0,
-            "start": 41197835,
-            "end": 41200482,
+            "start": 38543738,
+            "end": 38545423,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.30-21.48.03.log",
+            "filename": "/Mods/Multiplayer/objects/jokers/sandbox/extra-credit/couponsheet.lua",
             "crunched": 0,
-            "start": 41200482,
-            "end": 41212763,
+            "start": 38545423,
+            "end": 38547146,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.30-21.48.40.log",
+            "filename": "/Mods/Multiplayer/objects/jokers/sandbox/extra-credit/doublerainbow.lua",
             "crunched": 0,
-            "start": 41212763,
-            "end": 41237329,
+            "start": 38547146,
+            "end": 38548473,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.30-21.56.56.log",
+            "filename": "/Mods/Multiplayer/objects/jokers/sandbox/extra-credit/espresso.lua",
             "crunched": 0,
-            "start": 41237329,
-            "end": 41255511,
+            "start": 38548473,
+            "end": 38551033,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.30-21.59.06.log",
+            "filename": "/Mods/Multiplayer/objects/jokers/sandbox/extra-credit/farmer.lua",
             "crunched": 0,
-            "start": 41255511,
-            "end": 41282917,
+            "start": 38551033,
+            "end": 38552171,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.30-22.01.21.log",
+            "filename": "/Mods/Multiplayer/objects/jokers/sandbox/extra-credit/forklift.lua",
             "crunched": 0,
-            "start": 41282917,
-            "end": 41310323,
+            "start": 38552171,
+            "end": 38553330,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.30-22.02.03.log",
+            "filename": "/Mods/Multiplayer/objects/jokers/sandbox/extra-credit/gofish.lua",
             "crunched": 0,
-            "start": 41310323,
-            "end": 41337729,
+            "start": 38553330,
+            "end": 38554991,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.30-22.06.35.log",
+            "filename": "/Mods/Multiplayer/objects/jokers/sandbox/extra-credit/hoarder.lua",
             "crunched": 0,
-            "start": 41337729,
-            "end": 41365135,
+            "start": 38554991,
+            "end": 38555579,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.30-22.09.06.log",
+            "filename": "/Mods/Multiplayer/objects/jokers/sandbox/extra-credit/jokalisa.lua",
             "crunched": 0,
-            "start": 41365135,
-            "end": 41392541,
+            "start": 38555579,
+            "end": 38557317,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.30-22.13.44.log",
+            "filename": "/Mods/Multiplayer/objects/jokers/sandbox/extra-credit/jokeroftheyear.lua",
             "crunched": 0,
-            "start": 41392541,
-            "end": 41419946,
+            "start": 38557317,
+            "end": 38558150,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.30-22.15.01.log",
+            "filename": "/Mods/Multiplayer/objects/jokers/sandbox/extra-credit/lucky7.lua",
             "crunched": 0,
-            "start": 41419946,
-            "end": 41447352,
+            "start": 38558150,
+            "end": 38559684,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.30-22.20.24.log",
+            "filename": "/Mods/Multiplayer/objects/jokers/sandbox/extra-credit/montehaul.lua",
             "crunched": 0,
-            "start": 41447352,
-            "end": 41474758,
+            "start": 38559684,
+            "end": 38561816,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.30-22.23.43.log",
+            "filename": "/Mods/Multiplayer/objects/jokers/sandbox/extra-credit/pocketaces.lua",
             "crunched": 0,
-            "start": 41474758,
-            "end": 41502164,
+            "start": 38561816,
+            "end": 38563036,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.30-22.29.55.log",
+            "filename": "/Mods/Multiplayer/objects/jokers/sandbox/extra-credit/pyromancer.lua",
             "crunched": 0,
-            "start": 41502164,
-            "end": 41529570,
+            "start": 38563036,
+            "end": 38563996,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.30-22.32.43.log",
+            "filename": "/Mods/Multiplayer/objects/jokers/sandbox/extra-credit/shipoftheseus.lua",
             "crunched": 0,
-            "start": 41529570,
-            "end": 41556976,
+            "start": 38563996,
+            "end": 38566213,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.30-22.37.00.log",
+            "filename": "/Mods/Multiplayer/objects/jokers/sandbox/extra-credit/starfruit.lua",
             "crunched": 0,
-            "start": 41556976,
-            "end": 41584382,
+            "start": 38566213,
+            "end": 38568604,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.30-22.39.42.log",
+            "filename": "/Mods/Multiplayer/objects/jokers/sandbox/extra-credit/trafficlight.lua",
             "crunched": 0,
-            "start": 41584382,
-            "end": 41611788,
+            "start": 38568604,
+            "end": 38570376,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.09.30-22.43.09.log",
+            "filename": "/Mods/Multiplayer/objects/jokers/sandbox/extra-credit/tuxedo.lua",
             "crunched": 0,
-            "start": 41611788,
-            "end": 41639194,
+            "start": 38570376,
+            "end": 38571782,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.10.01-15.52.47.log",
+            "filename": "/Mods/Multiplayer/objects/jokers/sandbox/extra-credit/warlock.lua",
             "crunched": 0,
-            "start": 41639194,
-            "end": 41666601,
+            "start": 38571782,
+            "end": 38574257,
             "audio": false
         },
         {
-            "filename": "/Mods/lovely/log/lovely-2026.10.01-15.54.12.log",
+            "filename": "/Mods/Multiplayer/objects/jokers/sandbox/extra-credit/werewolf.lua",
             "crunched": 0,
-            "start": 41666601,
-            "end": 41694006,
+            "start": 38574257,
+            "end": 38575595,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/.env.example",
+            "filename": "/Mods/Multiplayer/objects/jokers/sandbox/faceless.lua",
             "crunched": 0,
-            "start": 41694006,
-            "end": 41694238,
+            "start": 38575595,
+            "end": 38577002,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/.gitignore",
+            "filename": "/Mods/Multiplayer/objects/jokers/sandbox/golden_ticket.lua",
             "crunched": 0,
-            "start": 41694238,
-            "end": 41694356,
+            "start": 38577002,
+            "end": 38578362,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/agents.md",
+            "filename": "/Mods/Multiplayer/objects/jokers/sandbox/hit_the_road.lua",
             "crunched": 0,
-            "start": 41694356,
-            "end": 41714903,
+            "start": 38578362,
+            "end": 38579532,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/assets/1x/alt_mp_stakes.png",
+            "filename": "/Mods/Multiplayer/objects/jokers/sandbox/idol.lua",
             "crunched": 0,
-            "start": 41714903,
-            "end": 41719151,
+            "start": 38579532,
+            "end": 38585939,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/assets/1x/alt_stickers.png",
+            "filename": "/Mods/Multiplayer/objects/jokers/sandbox/juggler.lua",
             "crunched": 0,
-            "start": 41719151,
-            "end": 41720705,
+            "start": 38585939,
+            "end": 38587760,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/assets/1x/b_heidelberg.png",
+            "filename": "/Mods/Multiplayer/objects/jokers/sandbox/loyalty_card.lua",
             "crunched": 0,
-            "start": 41720705,
-            "end": 41721912,
+            "start": 38587760,
+            "end": 38589955,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/assets/1x/blind_col.png",
+            "filename": "/Mods/Multiplayer/objects/jokers/sandbox/lucky_cat.lua",
             "crunched": 0,
-            "start": 41721912,
-            "end": 41827248,
+            "start": 38589955,
+            "end": 38591281,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/assets/1x/c_asteroid_ru.png",
+            "filename": "/Mods/Multiplayer/objects/jokers/sandbox/magnet_sandbox.lua",
             "crunched": 0,
-            "start": 41827248,
-            "end": 41852493,
+            "start": 38591281,
+            "end": 38594197,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/assets/1x/c_asteroid.png",
+            "filename": "/Mods/Multiplayer/objects/jokers/sandbox/mail.lua",
             "crunched": 0,
-            "start": 41852493,
-            "end": 41859545,
+            "start": 38594197,
+            "end": 38595756,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/assets/1x/c_ouija_2.png",
+            "filename": "/Mods/Multiplayer/objects/jokers/sandbox/misprint.lua",
             "crunched": 0,
-            "start": 41859545,
-            "end": 41860944,
+            "start": 38595756,
+            "end": 38596910,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/assets/1x/deck_stickers.png",
+            "filename": "/Mods/Multiplayer/objects/jokers/sandbox/order.lua",
             "crunched": 0,
-            "start": 41860944,
-            "end": 41887570,
+            "start": 38596910,
+            "end": 38598269,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/assets/1x/decks.png",
+            "filename": "/Mods/Multiplayer/objects/jokers/sandbox/photograph.lua",
             "crunched": 0,
-            "start": 41887570,
-            "end": 41914569,
+            "start": 38598269,
+            "end": 38599278,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/assets/1x/ec_jokers_sandbox.png",
+            "filename": "/Mods/Multiplayer/objects/jokers/sandbox/ride_the_bus.lua",
             "crunched": 0,
-            "start": 41914569,
-            "end": 42112867,
+            "start": 38599278,
+            "end": 38601159,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/assets/1x/ec_other_sandbox.png",
+            "filename": "/Mods/Multiplayer/objects/jokers/sandbox/runner.lua",
             "crunched": 0,
-            "start": 42112867,
-            "end": 42218244,
+            "start": 38601159,
+            "end": 38602243,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/assets/1x/j_baseball_sandbox.png",
+            "filename": "/Mods/Multiplayer/objects/jokers/sandbox/satellite.lua",
             "crunched": 0,
-            "start": 42218244,
-            "end": 42229112,
+            "start": 38602243,
+            "end": 38603774,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/assets/1x/j_bloodstone_sandbox.png",
+            "filename": "/Mods/Multiplayer/objects/jokers/sandbox/square.lua",
             "crunched": 0,
-            "start": 42229112,
-            "end": 42236146,
+            "start": 38603774,
+            "end": 38604898,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/assets/1x/j_castle_sandbox.png",
+            "filename": "/Mods/Multiplayer/objects/jokers/sandbox/steel_joker.lua",
             "crunched": 0,
-            "start": 42236146,
-            "end": 42246360,
+            "start": 38604898,
+            "end": 38605749,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/assets/1x/j_cloud_9_sandbox.png",
+            "filename": "/Mods/Multiplayer/objects/jokers/sandbox/throwback.lua",
             "crunched": 0,
-            "start": 42246360,
-            "end": 42255053,
+            "start": 38605749,
+            "end": 38608061,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/assets/1x/j_conjoined_joker.png",
+            "filename": "/Mods/Multiplayer/objects/jokers/sandbox/vampire.lua",
             "crunched": 0,
-            "start": 42255053,
-            "end": 42257975,
+            "start": 38608061,
+            "end": 38610253,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/assets/1x/j_constellation_sandbox.png",
+            "filename": "/Mods/Multiplayer/objects/jokers/skip_off.lua",
             "crunched": 0,
-            "start": 42257975,
-            "end": 42268712,
+            "start": 38610253,
+            "end": 38612124,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/assets/1x/j_copycat.png",
+            "filename": "/Mods/Multiplayer/objects/jokers/speedrun.lua",
             "crunched": 0,
-            "start": 42268712,
-            "end": 42275433,
+            "start": 38612124,
+            "end": 38613848,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/assets/1x/j_defensive_joker.png",
+            "filename": "/Mods/Multiplayer/objects/jokers/standard/bloodstone.lua",
             "crunched": 0,
-            "start": 42275433,
-            "end": 42277401,
+            "start": 38613848,
+            "end": 38615963,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/assets/1x/j_ERROR_sandbox.png",
+            "filename": "/Mods/Multiplayer/objects/jokers/standard/hanging_chad.lua",
             "crunched": 0,
-            "start": 42277401,
-            "end": 42278217,
+            "start": 38615963,
+            "end": 38616808,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/assets/1x/j_faceless_sandbox.png",
+            "filename": "/Mods/Multiplayer/objects/jokers/standard/ice_cream.lua",
             "crunched": 0,
-            "start": 42278217,
-            "end": 42284636,
+            "start": 38616808,
+            "end": 38617928,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/assets/1x/j_hit_the_road_sandbox.png",
+            "filename": "/Mods/Multiplayer/objects/jokers/standard/seltzer.lua",
             "crunched": 0,
-            "start": 42284636,
-            "end": 42296621,
+            "start": 38617928,
+            "end": 38620145,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/assets/1x/j_idol_sandbox_bw.png",
+            "filename": "/Mods/Multiplayer/objects/jokers/standard/ticket.lua",
             "crunched": 0,
-            "start": 42296621,
-            "end": 42299342,
+            "start": 38620145,
+            "end": 38622032,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/assets/1x/j_idol_sandbox_color.png",
+            "filename": "/Mods/Multiplayer/objects/jokers/standard/turtle_bean.lua",
             "crunched": 0,
-            "start": 42299342,
-            "end": 42304509,
+            "start": 38622032,
+            "end": 38623336,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/assets/1x/j_juggler_sandbox.png",
+            "filename": "/Mods/Multiplayer/objects/jokers/taxes.lua",
             "crunched": 0,
-            "start": 42304509,
-            "end": 42313046,
+            "start": 38623336,
+            "end": 38624926,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/assets/1x/j_lets_go_gambling.png",
+            "filename": "/Mods/Multiplayer/objects/seals/mp_gold_seal.lua",
             "crunched": 0,
-            "start": 42313046,
-            "end": 42316659,
+            "start": 38624926,
+            "end": 38625225,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/assets/1x/j_loyalty_card_sandbox.png",
+            "filename": "/Mods/Multiplayer/objects/stakes/00_planet.lua",
             "crunched": 0,
-            "start": 42316659,
-            "end": 42326608,
+            "start": 38625225,
+            "end": 38625906,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/assets/1x/j_lucky_cat_sandbox.png",
+            "filename": "/Mods/Multiplayer/objects/stakes/01_spectral.lua",
             "crunched": 0,
-            "start": 42326608,
-            "end": 42339109,
+            "start": 38625906,
+            "end": 38626315,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/assets/1x/j_magnet.png",
+            "filename": "/Mods/Multiplayer/objects/stakes/02_spectralplus.lua",
             "crunched": 0,
-            "start": 42339109,
-            "end": 42343904,
+            "start": 38626315,
+            "end": 38626681,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/assets/1x/j_mail_sandbox.png",
+            "filename": "/Mods/Multiplayer/objects/stakes/1_plastic.lua",
             "crunched": 0,
-            "start": 42343904,
-            "end": 42353032,
+            "start": 38626681,
+            "end": 38629423,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/assets/1x/j_misprint_sandbox.png",
+            "filename": "/Mods/Multiplayer/objects/stakes/2_pebble.lua",
             "crunched": 0,
-            "start": 42353032,
-            "end": 42357520,
+            "start": 38629423,
+            "end": 38629857,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/assets/1x/j_order_sandbox.png",
+            "filename": "/Mods/Multiplayer/objects/stakes/3_ferrite.lua",
             "crunched": 0,
-            "start": 42357520,
-            "end": 42366131,
+            "start": 38629857,
+            "end": 38630280,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/assets/1x/j_pacifist.png",
+            "filename": "/Mods/Multiplayer/objects/stakes/4_pyrite.lua",
             "crunched": 0,
-            "start": 42366131,
-            "end": 42368116,
+            "start": 38630280,
+            "end": 38631270,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/assets/1x/j_penny_pincher.png",
+            "filename": "/Mods/Multiplayer/objects/stakes/5_jade.lua",
             "crunched": 0,
-            "start": 42368116,
-            "end": 42370411,
+            "start": 38631270,
+            "end": 38631698,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/assets/1x/j_photograph_sandbox.png",
+            "filename": "/Mods/Multiplayer/objects/stakes/6_crystal.lua",
             "crunched": 0,
-            "start": 42370411,
-            "end": 42380551,
+            "start": 38631698,
+            "end": 38632114,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/assets/1x/j_pizza.png",
+            "filename": "/Mods/Multiplayer/objects/stakes/7_antimatter.lua",
             "crunched": 0,
-            "start": 42380551,
-            "end": 42383949,
+            "start": 38632114,
+            "end": 38632540,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/assets/1x/j_ride_the_bus_sandbox.png",
+            "filename": "/Mods/Multiplayer/objects/stakes/atlas.lua",
             "crunched": 0,
-            "start": 42383949,
-            "end": 42385693,
+            "start": 38632540,
+            "end": 38632721,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/assets/1x/j_runner_sandbox.png",
+            "filename": "/Mods/Multiplayer/objects/stickers/_stickers.lua",
             "crunched": 0,
-            "start": 42385693,
-            "end": 42392457,
+            "start": 38632721,
+            "end": 38635380,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/assets/1x/j_satellite_sandbox.png",
+            "filename": "/Mods/Multiplayer/objects/stickers/1_persistent.lua",
             "crunched": 0,
-            "start": 42392457,
-            "end": 42399610,
+            "start": 38635380,
+            "end": 38640058,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/assets/1x/j_skip_off.png",
+            "filename": "/Mods/Multiplayer/objects/stickers/2_unreliable.lua",
             "crunched": 0,
-            "start": 42399610,
-            "end": 42401406,
+            "start": 38640058,
+            "end": 38640540,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/assets/1x/j_speedrun.png",
+            "filename": "/Mods/Multiplayer/objects/stickers/3_draining.lua",
             "crunched": 0,
-            "start": 42401406,
-            "end": 42402021,
+            "start": 38640540,
+            "end": 38640913,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/assets/1x/j_square_sandbox.png",
+            "filename": "/Mods/Multiplayer/objects/stickers/balanced.lua",
             "crunched": 0,
-            "start": 42402021,
-            "end": 42406253,
+            "start": 38640913,
+            "end": 38641396,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/assets/1x/j_steel_joker_sandbox.png",
+            "filename": "/Mods/Multiplayer/objects/stickers/extra_credit.lua",
             "crunched": 0,
-            "start": 42406253,
-            "end": 42412295,
+            "start": 38641396,
+            "end": 38641610,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/assets/1x/j_taxes.png",
+            "filename": "/Mods/Multiplayer/objects/stickers/nemesis.lua",
             "crunched": 0,
-            "start": 42412295,
-            "end": 42419336,
+            "start": 38641610,
+            "end": 38641883,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/assets/1x/j_throwback_sandbox.png",
+            "filename": "/Mods/Multiplayer/objects/tags/gambling_sandbox.lua",
             "crunched": 0,
-            "start": 42419336,
-            "end": 42429121,
+            "start": 38641883,
+            "end": 38643685,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/assets/1x/j_vampire_sandbox.png",
+            "filename": "/Mods/Multiplayer/objects/tags/investment_sandbox.lua",
             "crunched": 0,
-            "start": 42429121,
-            "end": 42436225,
+            "start": 38643685,
+            "end": 38644789,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/assets/1x/modicon.png",
+            "filename": "/Mods/Multiplayer/objects/tags/juggle_sandbox.lua",
             "crunched": 0,
-            "start": 42436225,
-            "end": 42436695,
+            "start": 38644789,
+            "end": 38645425,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/assets/1x/player_blind_row.png",
+            "filename": "/Mods/Multiplayer/overrides/disable_restart.lua",
             "crunched": 0,
-            "start": 42436695,
-            "end": 42438265,
+            "start": 38645425,
+            "end": 38645595,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/assets/1x/release_jokers.png",
+            "filename": "/Mods/Multiplayer/overrides/game.lua",
             "crunched": 0,
-            "start": 42438265,
-            "end": 43027563,
+            "start": 38645595,
+            "end": 38651691,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/assets/1x/stakes-chips.png",
+            "filename": "/Mods/Multiplayer/overrides/hide_content.lua",
             "crunched": 0,
-            "start": 43027563,
-            "end": 43029593,
+            "start": 38651691,
+            "end": 38653913,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/assets/1x/standard_giga.png",
+            "filename": "/Mods/Multiplayer/overrides/mod_badges.lua",
             "crunched": 0,
-            "start": 43029593,
-            "end": 43033577,
+            "start": 38653913,
+            "end": 38656849,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/assets/1x/sticker_balanced.png",
+            "filename": "/Mods/Multiplayer/README.md",
             "crunched": 0,
-            "start": 43033577,
-            "end": 43038070,
+            "start": 38656849,
+            "end": 38660194,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/assets/1x/sticker_nemesis.png",
+            "filename": "/Mods/Multiplayer/replays/.gitkeep",
             "crunched": 0,
-            "start": 43038070,
-            "end": 43038632,
+            "start": 38660194,
+            "end": 38660194,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/assets/1x/stickers.png",
+            "filename": "/Mods/Multiplayer/rulesets/_rulesets.lua",
             "crunched": 0,
-            "start": 43038632,
-            "end": 43043016,
+            "start": 38660194,
+            "end": 38671729,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/assets/1x/tag_gambling_sandbox.png",
+            "filename": "/Mods/Multiplayer/rulesets/badlatro.lua",
             "crunched": 0,
-            "start": 43043016,
-            "end": 43044809,
+            "start": 38671729,
+            "end": 38672932,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/assets/2x/alt_mp_stakes.png",
+            "filename": "/Mods/Multiplayer/rulesets/blitz.lua",
             "crunched": 0,
-            "start": 43044809,
-            "end": 43066839,
+            "start": 38672932,
+            "end": 38672999,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/assets/2x/alt_stickers.png",
+            "filename": "/Mods/Multiplayer/rulesets/chaos.lua",
             "crunched": 0,
-            "start": 43066839,
-            "end": 43070307,
+            "start": 38672999,
+            "end": 38673115,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/assets/2x/b_heidelberg.png",
+            "filename": "/Mods/Multiplayer/rulesets/experimental/experimental_legacy.lua",
             "crunched": 0,
-            "start": 43070307,
-            "end": 43072810,
+            "start": 38673115,
+            "end": 38673760,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/assets/2x/blind_col.png",
+            "filename": "/Mods/Multiplayer/rulesets/experimental/experimental.lua",
             "crunched": 0,
-            "start": 43072810,
-            "end": 43265071,
+            "start": 38673760,
+            "end": 38674032,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/assets/2x/c_asteroid_ru.png",
+            "filename": "/Mods/Multiplayer/rulesets/legacy_ranked.lua",
             "crunched": 0,
-            "start": 43265071,
-            "end": 43272783,
+            "start": 38674032,
+            "end": 38674160,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/assets/2x/c_asteroid.png",
+            "filename": "/Mods/Multiplayer/rulesets/majorleague.lua",
             "crunched": 0,
-            "start": 43272783,
-            "end": 43281001,
+            "start": 38674160,
+            "end": 38675020,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/assets/2x/c_ouija_2.png",
+            "filename": "/Mods/Multiplayer/rulesets/minorleague.lua",
             "crunched": 0,
-            "start": 43281001,
-            "end": 43283940,
+            "start": 38675020,
+            "end": 38675633,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/assets/2x/deck_stickers.png",
+            "filename": "/Mods/Multiplayer/rulesets/ranked.lua",
             "crunched": 0,
-            "start": 43283940,
-            "end": 43325349,
+            "start": 38675633,
+            "end": 38675777,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/assets/2x/decks.png",
+            "filename": "/Mods/Multiplayer/rulesets/release.lua",
             "crunched": 0,
-            "start": 43325349,
-            "end": 43376148,
+            "start": 38675777,
+            "end": 38697558,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/assets/2x/ec_jokers_sandbox.png",
+            "filename": "/Mods/Multiplayer/rulesets/sandbox.lua",
             "crunched": 0,
-            "start": 43376148,
-            "end": 43637406,
+            "start": 38697558,
+            "end": 38697831,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/assets/2x/ec_other_sandbox.png",
+            "filename": "/Mods/Multiplayer/rulesets/smallworld.lua",
             "crunched": 0,
-            "start": 43637406,
-            "end": 43695206,
+            "start": 38697831,
+            "end": 38697917,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/assets/2x/j_baseball_sandbox.png",
+            "filename": "/Mods/Multiplayer/rulesets/speedlatro.lua",
             "crunched": 0,
-            "start": 43695206,
-            "end": 43722328,
+            "start": 38697917,
+            "end": 38698053,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/assets/2x/j_bloodstone_sandbox.png",
+            "filename": "/Mods/Multiplayer/rulesets/traditional.lua",
             "crunched": 0,
-            "start": 43722328,
-            "end": 43735670,
+            "start": 38698053,
+            "end": 38698285,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/assets/2x/j_castle_sandbox.png",
+            "filename": "/Mods/Multiplayer/rulesets/vanilla.lua",
             "crunched": 0,
-            "start": 43735670,
-            "end": 43760768,
+            "start": 38698285,
+            "end": 38698644,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/assets/2x/j_cloud_9_sandbox.png",
+            "filename": "/Mods/Multiplayer/rulesets/wsob.lua",
             "crunched": 0,
-            "start": 43760768,
-            "end": 43783724,
+            "start": 38698644,
+            "end": 38699416,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/assets/2x/j_conjoined_joker.png",
+            "filename": "/Mods/Multiplayer/scripts/release.sh",
             "crunched": 0,
-            "start": 43783724,
-            "end": 43786926,
+            "start": 38699416,
+            "end": 38705289,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/assets/2x/j_constellation_sandbox.png",
+            "filename": "/Mods/Multiplayer/stylua.toml",
             "crunched": 0,
-            "start": 43786926,
-            "end": 43812413,
+            "start": 38705289,
+            "end": 38705642,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/assets/2x/j_copycat.png",
+            "filename": "/Mods/Multiplayer/tests/readme.md",
             "crunched": 0,
-            "start": 43812413,
-            "end": 43819942,
+            "start": 38705642,
+            "end": 38708864,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/assets/2x/j_defensive_joker.png",
+            "filename": "/Mods/Multiplayer/tests/ruleset_shape.snapshot.lua",
             "crunched": 0,
-            "start": 43819942,
-            "end": 43822344,
+            "start": 38708864,
+            "end": 38726656,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/assets/2x/j_ERROR_sandbox.png",
+            "filename": "/Mods/Multiplayer/tests/test_rlog_checksum.lua",
             "crunched": 0,
-            "start": 43822344,
-            "end": 43823998,
+            "start": 38726656,
+            "end": 38728968,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/assets/2x/j_faceless_sandbox.png",
+            "filename": "/Mods/Multiplayer/tests/test_rlog_roundtrip.lua",
             "crunched": 0,
-            "start": 43823998,
-            "end": 43839063,
+            "start": 38728968,
+            "end": 38734278,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/assets/2x/j_hit_the_road_sandbox.png",
+            "filename": "/Mods/Multiplayer/tests/test_rlog_stream.lua",
             "crunched": 0,
-            "start": 43839063,
-            "end": 43868888,
+            "start": 38734278,
+            "end": 38737703,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/assets/2x/j_idol_sandbox_bw.png",
+            "filename": "/Mods/Multiplayer/tests/test_ruleset_shape.lua",
             "crunched": 0,
-            "start": 43868888,
-            "end": 43879343,
+            "start": 38737703,
+            "end": 38748700,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/assets/2x/j_idol_sandbox_color.png",
+            "filename": "/Mods/Multiplayer/tests/test_serialization_guard.lua",
             "crunched": 0,
-            "start": 43879343,
-            "end": 43890105,
+            "start": 38748700,
+            "end": 38751673,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/assets/2x/j_juggler_sandbox.png",
+            "filename": "/Mods/Multiplayer/ui/_common/background_grouping.lua",
             "crunched": 0,
-            "start": 43890105,
-            "end": 43909359,
+            "start": 38751673,
+            "end": 38752248,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/assets/2x/j_lets_go_gambling.png",
+            "filename": "/Mods/Multiplayer/ui/_common/disableable_button.lua",
             "crunched": 0,
-            "start": 43909359,
-            "end": 43913344,
+            "start": 38752248,
+            "end": 38753125,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/assets/2x/j_loyalty_card_sandbox.png",
+            "filename": "/Mods/Multiplayer/ui/_common/disableable_option_cycle.lua",
             "crunched": 0,
-            "start": 43913344,
-            "end": 43936606,
+            "start": 38753125,
+            "end": 38753468,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/assets/2x/j_lucky_cat_sandbox.png",
+            "filename": "/Mods/Multiplayer/ui/_common/disableable_toggle.lua",
             "crunched": 0,
-            "start": 43936606,
-            "end": 43977823,
+            "start": 38753468,
+            "end": 38754130,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/assets/2x/j_magnet.png",
+            "filename": "/Mods/Multiplayer/ui/_common/spacer.lua",
             "crunched": 0,
-            "start": 43977823,
-            "end": 43983995,
+            "start": 38754130,
+            "end": 38754403,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/assets/2x/j_mail_sandbox.png",
+            "filename": "/Mods/Multiplayer/ui/game/blind_chip_sprite.lua",
             "crunched": 0,
-            "start": 43983995,
-            "end": 44005961,
+            "start": 38754403,
+            "end": 38755071,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/assets/2x/j_misprint_sandbox.png",
+            "filename": "/Mods/Multiplayer/ui/game/blind_choice.lua",
             "crunched": 0,
-            "start": 44005961,
-            "end": 44028098,
+            "start": 38755071,
+            "end": 38769479,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/assets/2x/j_order_sandbox.png",
+            "filename": "/Mods/Multiplayer/ui/game/blind_hud.lua",
             "crunched": 0,
-            "start": 44028098,
-            "end": 44048470,
+            "start": 38769479,
+            "end": 38779970,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/assets/2x/j_pacifist.png",
+            "filename": "/Mods/Multiplayer/ui/game/confirmation.lua",
             "crunched": 0,
-            "start": 44048470,
-            "end": 44050971,
+            "start": 38779970,
+            "end": 38780890,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/assets/2x/j_penny_pincher.png",
+            "filename": "/Mods/Multiplayer/ui/game/enemy_location.lua",
             "crunched": 0,
-            "start": 44050971,
-            "end": 44053772,
+            "start": 38780890,
+            "end": 38787681,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/assets/2x/j_photograph_sandbox.png",
+            "filename": "/Mods/Multiplayer/ui/game/functions.lua",
             "crunched": 0,
-            "start": 44053772,
-            "end": 44079131,
+            "start": 38787681,
+            "end": 38802444,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/assets/2x/j_pizza.png",
+            "filename": "/Mods/Multiplayer/ui/game/game_end.lua",
             "crunched": 0,
-            "start": 44079131,
-            "end": 44083138,
+            "start": 38802444,
+            "end": 38820340,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/assets/2x/j_ride_the_bus_sandbox.png",
+            "filename": "/Mods/Multiplayer/ui/game/game_state.lua",
             "crunched": 0,
-            "start": 44083138,
-            "end": 44088577,
+            "start": 38820340,
+            "end": 38840112,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/assets/2x/j_runner_sandbox.png",
+            "filename": "/Mods/Multiplayer/ui/game/lobby_info.lua",
             "crunched": 0,
-            "start": 44088577,
-            "end": 44103484,
+            "start": 38840112,
+            "end": 38847937,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/assets/2x/j_satellite_sandbox.png",
+            "filename": "/Mods/Multiplayer/ui/game/round.lua",
             "crunched": 0,
-            "start": 44103484,
-            "end": 44119566,
+            "start": 38847937,
+            "end": 38851026,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/assets/2x/j_skip_off.png",
+            "filename": "/Mods/Multiplayer/ui/game/ruleset_info_menu.lua",
             "crunched": 0,
-            "start": 44119566,
-            "end": 44121742,
+            "start": 38851026,
+            "end": 38855224,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/assets/2x/j_speedrun.png",
+            "filename": "/Mods/Multiplayer/ui/game/timer.lua",
             "crunched": 0,
-            "start": 44121742,
-            "end": 44123026,
+            "start": 38855224,
+            "end": 38875157,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/assets/2x/j_square_sandbox.png",
+            "filename": "/Mods/Multiplayer/ui/lobby/_lobby_options/advanced_tab.lua",
             "crunched": 0,
-            "start": 44123026,
-            "end": 44132379,
+            "start": 38875157,
+            "end": 38879809,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/assets/2x/j_steel_joker_sandbox.png",
+            "filename": "/Mods/Multiplayer/ui/lobby/_lobby_options/gameplay_tab.lua",
             "crunched": 0,
-            "start": 44132379,
-            "end": 44145588,
+            "start": 38879809,
+            "end": 38880449,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/assets/2x/j_taxes.png",
+            "filename": "/Mods/Multiplayer/ui/lobby/_lobby_options/main_options.lua",
             "crunched": 0,
-            "start": 44145588,
-            "end": 44149681,
+            "start": 38880449,
+            "end": 38884305,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/assets/2x/j_throwback_sandbox.png",
+            "filename": "/Mods/Multiplayer/ui/lobby/_lobby_options/modifiers_tab.lua",
             "crunched": 0,
-            "start": 44149681,
-            "end": 44173170,
+            "start": 38884305,
+            "end": 38887376,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/assets/2x/j_vampire_sandbox.png",
+            "filename": "/Mods/Multiplayer/ui/lobby/_lobby_options/options_tab.lua",
             "crunched": 0,
-            "start": 44173170,
-            "end": 44190478,
+            "start": 38887376,
+            "end": 38889989,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/assets/2x/modicon.png",
+            "filename": "/Mods/Multiplayer/ui/lobby/deck_stake_button.lua",
             "crunched": 0,
-            "start": 44190478,
-            "end": 44191181,
+            "start": 38889989,
+            "end": 38891156,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/assets/2x/player_blind_row.png",
+            "filename": "/Mods/Multiplayer/ui/lobby/leave_button.lua",
             "crunched": 0,
-            "start": 44191181,
-            "end": 44195459,
+            "start": 38891156,
+            "end": 38891459,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/assets/2x/release_jokers.png",
+            "filename": "/Mods/Multiplayer/ui/lobby/lobby_code_buttons.lua",
             "crunched": 0,
-            "start": 44195459,
-            "end": 45060369,
+            "start": 38891459,
+            "end": 38892052,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/assets/2x/stakes-chips.png",
+            "filename": "/Mods/Multiplayer/ui/lobby/lobby.lua",
             "crunched": 0,
-            "start": 45060369,
-            "end": 45069144,
+            "start": 38892052,
+            "end": 38908890,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/assets/2x/standard_giga.png",
+            "filename": "/Mods/Multiplayer/ui/lobby/players_display.lua",
             "crunched": 0,
-            "start": 45069144,
-            "end": 45077582,
+            "start": 38908890,
+            "end": 38910170,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/assets/2x/sticker_balanced.png",
+            "filename": "/Mods/Multiplayer/ui/lobby/start_ready_button.lua",
             "crunched": 0,
-            "start": 45077582,
-            "end": 45078601,
+            "start": 38910170,
+            "end": 38914596,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/assets/2x/sticker_nemesis.png",
+            "filename": "/Mods/Multiplayer/ui/lobby/version_mismatch_warning.lua",
             "crunched": 0,
-            "start": 45078601,
-            "end": 45079493,
+            "start": 38914596,
+            "end": 38918166,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/assets/2x/tag_gambling_sandbox.png",
+            "filename": "/Mods/Multiplayer/ui/main_menu/dev_warning.lua",
             "crunched": 0,
-            "start": 45079493,
-            "end": 45080196,
+            "start": 38918166,
+            "end": 38920406,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/CHANGELOG.md",
+            "filename": "/Mods/Multiplayer/ui/main_menu/main_menu.lua",
             "crunched": 0,
-            "start": 45080196,
-            "end": 45082318,
+            "start": 38920406,
+            "end": 38923091,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/compatibility/_compatibility.lua",
+            "filename": "/Mods/Multiplayer/ui/main_menu/play_button/_modifiers_overlay.lua",
             "crunched": 0,
-            "start": 45082318,
-            "end": 45084313,
+            "start": 38923091,
+            "end": 38925291,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/compatibility/AntePreview.lua",
+            "filename": "/Mods/Multiplayer/ui/main_menu/play_button/_mutators_wall.lua",
             "crunched": 0,
-            "start": 45084313,
-            "end": 45084704,
+            "start": 38925291,
+            "end": 38940449,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/compatibility/CodexArcanum.lua",
+            "filename": "/Mods/Multiplayer/ui/main_menu/play_button/_practice_options_overlay.lua",
             "crunched": 0,
-            "start": 45084704,
-            "end": 45084930,
+            "start": 38940449,
+            "end": 38942659,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/compatibility/Cryptid.lua",
+            "filename": "/Mods/Multiplayer/ui/main_menu/play_button/custom_ruleset_editor.lua",
             "crunched": 0,
-            "start": 45084930,
-            "end": 45086831,
+            "start": 38942659,
+            "end": 38951998,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/compatibility/Distro.lua",
+            "filename": "/Mods/Multiplayer/ui/main_menu/play_button/gamemode_selection.lua",
             "crunched": 0,
-            "start": 45086831,
-            "end": 45089567,
+            "start": 38951998,
+            "end": 38956817,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/compatibility/ExtraCredit.lua",
+            "filename": "/Mods/Multiplayer/ui/main_menu/play_button/ghost_replay_picker.lua",
             "crunched": 0,
-            "start": 45089567,
-            "end": 45089766,
+            "start": 38956817,
+            "end": 38976343,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/compatibility/Handy.lua",
+            "filename": "/Mods/Multiplayer/ui/main_menu/play_button/join_lobby_button.lua",
             "crunched": 0,
-            "start": 45089766,
-            "end": 45094908,
+            "start": 38976343,
+            "end": 38977181,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/compatibility/HotPotato.lua",
+            "filename": "/Mods/Multiplayer/ui/main_menu/play_button/play_button_callbacks.lua",
             "crunched": 0,
-            "start": 45094908,
-            "end": 45098721,
+            "start": 38977181,
+            "end": 38981457,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/compatibility/Jen.lua",
+            "filename": "/Mods/Multiplayer/ui/main_menu/play_button/play_button.lua",
             "crunched": 0,
-            "start": 45098721,
-            "end": 45098992,
+            "start": 38981457,
+            "end": 38983392,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/compatibility/JokerDisplay.lua",
+            "filename": "/Mods/Multiplayer/ui/main_menu/play_button/ruleset_selection.lua",
             "crunched": 0,
-            "start": 45098992,
-            "end": 45107854,
+            "start": 38983392,
+            "end": 39003866,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/compatibility/Ortalab.lua",
+            "filename": "/Mods/Multiplayer/ui/main_menu/play_button/weekly_interrupt.lua",
             "crunched": 0,
-            "start": 45107854,
-            "end": 45108158,
+            "start": 39003866,
+            "end": 39004838,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/compatibility/Pokermon.lua",
+            "filename": "/Mods/Multiplayer/ui/main_menu/title_card.lua",
             "crunched": 0,
-            "start": 45108158,
-            "end": 45108405,
+            "start": 39004838,
+            "end": 39008827,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/compatibility/Preview/CorePreview.lua",
+            "filename": "/Mods/Multiplayer/ui/main_menu/version_display.lua",
             "crunched": 0,
-            "start": 45108405,
-            "end": 45117775,
+            "start": 39008827,
+            "end": 39009381,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/compatibility/Preview/EngineSimulate.lua",
+            "filename": "/Mods/Multiplayer/ui/shortcuts_menu.lua",
             "crunched": 0,
-            "start": 45117775,
-            "end": 45134333,
+            "start": 39009381,
+            "end": 39014984,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/compatibility/Preview/InitPreview.lua",
+            "filename": "/Mods/Multiplayer/ui/smods_menu/config_tab.lua",
             "crunched": 0,
-            "start": 45134333,
-            "end": 45138566,
+            "start": 39014984,
+            "end": 39018560,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/compatibility/Preview/InitSimulate.lua",
+            "filename": "/Mods/Multiplayer/ui/smods_menu/credits_tab.lua",
             "crunched": 0,
-            "start": 45138566,
-            "end": 45139578,
+            "start": 39018560,
+            "end": 39020031,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/compatibility/Preview/InterfacePreview.lua",
+            "filename": "/Mods/Multiplayer/ui/smods_menu/customization_tab.lua",
             "crunched": 0,
-            "start": 45139578,
-            "end": 45144524,
+            "start": 39020031,
+            "end": 39024725,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/compatibility/Preview/Jokers/_Vanilla.lua",
+            "filename": "/Mods/Multiplayer/ui/smods_menu/smods_menu.lua",
             "crunched": 0,
-            "start": 45144524,
-            "end": 45180373,
+            "start": 39024725,
+            "end": 39026166,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/compatibility/Preview/Jokers/Multiplayer.lua",
+            "filename": "/Mods/Multiplayer/ui/utils.lua",
             "crunched": 0,
-            "start": 45180373,
-            "end": 45182751,
+            "start": 39026166,
+            "end": 39029520,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/compatibility/Preview/UtilsPreview.lua",
+            "filename": "/Mods/Noituus/assets/1x/icon.png",
             "crunched": 0,
-            "start": 45182751,
-            "end": 45183619,
+            "start": 39029520,
+            "end": 39030930,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/compatibility/Preview/UtilsSimulate.lua",
+            "filename": "/Mods/Noituus/assets/2x/icon.png",
             "crunched": 0,
-            "start": 45183619,
-            "end": 45190846,
+            "start": 39030930,
+            "end": 39032537,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/compatibility/StrangePencil.lua",
+            "filename": "/Mods/Noituus/config.lua",
             "crunched": 0,
-            "start": 45190846,
-            "end": 45191473,
+            "start": 39032537,
+            "end": 39033195,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/compatibility/Talisman.lua",
+            "filename": "/Mods/Noituus/localization/default.lua",
             "crunched": 0,
-            "start": 45191473,
-            "end": 45191521,
+            "start": 39033195,
+            "end": 39033433,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/compatibility/TheOrder.lua",
+            "filename": "/Mods/Noituus/lovely.toml",
             "crunched": 0,
-            "start": 45191521,
-            "end": 45215767,
+            "start": 39033433,
+            "end": 39038437,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/compatibility/TooManyJokers.lua",
+            "filename": "/Mods/Noituus/modules/api.lua",
             "crunched": 0,
-            "start": 45215767,
-            "end": 45216175,
+            "start": 39038437,
+            "end": 39041202,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/compatibility/UpgradeMod.lua",
+            "filename": "/Mods/Noituus/modules/base_compat.lua",
             "crunched": 0,
-            "start": 45216175,
-            "end": 45217036,
+            "start": 39041202,
+            "end": 39041576,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/config.lua",
+            "filename": "/Mods/Noituus/modules/config.lua",
             "crunched": 0,
-            "start": 45217036,
-            "end": 45217400,
+            "start": 39041576,
+            "end": 39056667,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/CONTRIBUTING.md",
+            "filename": "/Mods/Noituus/modules/incantation_compat.lua",
             "crunched": 0,
-            "start": 45217400,
-            "end": 45221633,
+            "start": 39056667,
+            "end": 39057642,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/core.lua",
+            "filename": "/Mods/Noituus/modules/init.lua",
             "crunched": 0,
-            "start": 45221633,
-            "end": 45230932,
+            "start": 39057642,
+            "end": 39058958,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/gamemodes/_gamemodes.lua",
+            "filename": "/Mods/Noituus/modules/jenlib.lua",
             "crunched": 0,
-            "start": 45230932,
-            "end": 45231838,
+            "start": 39058958,
+            "end": 39087971,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/gamemodes/attrition.lua",
+            "filename": "/Mods/Noituus/modules/main.lua",
             "crunched": 0,
-            "start": 45231838,
-            "end": 45236122,
+            "start": 39087971,
+            "end": 39117915,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/gamemodes/showdown.lua",
+            "filename": "/Mods/Noituus/modules/overflow_compat.lua",
             "crunched": 0,
-            "start": 45236122,
-            "end": 45240331,
+            "start": 39117915,
+            "end": 39118278,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/gamemodes/survival.lua",
+            "filename": "/Mods/Noituus/modules/ui.lua",
             "crunched": 0,
-            "start": 45240331,
-            "end": 45243092,
+            "start": 39118278,
+            "end": 39164619,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/layers/_layers.lua",
+            "filename": "/Mods/Noituus/modules/vanilla_compat.lua",
             "crunched": 0,
-            "start": 45243092,
-            "end": 45252134,
+            "start": 39164619,
+            "end": 39167012,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/layers/ban_mutators.lua",
+            "filename": "/Mods/Noituus/Noituus.json",
             "crunched": 0,
-            "start": 45252134,
-            "end": 45252785,
+            "start": 39167012,
+            "end": 39167441,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/layers/classic.lua",
+            "filename": "/Mods/Noituus/Noituus.lua",
             "crunched": 0,
-            "start": 45252785,
-            "end": 45252884,
+            "start": 39167441,
+            "end": 39167841,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/layers/economy_mutators.lua",
+            "filename": "/Mods/Nopeus/LICENSE",
             "crunched": 0,
-            "start": 45252884,
-            "end": 45253952,
+            "start": 39167841,
+            "end": 39203664,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/layers/eeeee.lua",
+            "filename": "/Mods/Nopeus/lovely.toml",
             "crunched": 0,
-            "start": 45253952,
-            "end": 45254828,
+            "start": 39203664,
+            "end": 39205858,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/layers/esoteric_mutators.lua",
+            "filename": "/Mods/Nopeus/Nopeus.lua",
             "crunched": 0,
-            "start": 45254828,
-            "end": 45255227,
+            "start": 39205858,
+            "end": 39214395,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/layers/experimental.lua",
+            "filename": "/Mods/Omegatro/assets/1x/👀.png",
             "crunched": 0,
-            "start": 45255227,
-            "end": 45257238,
+            "start": 39214395,
+            "end": 39215480,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/layers/glass_cannon.lua",
+            "filename": "/Mods/Omegatro/assets/1x/all_in.png",
             "crunched": 0,
-            "start": 45257238,
-            "end": 45258026,
+            "start": 39215480,
+            "end": 39227289,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/layers/glass_variants.lua",
+            "filename": "/Mods/Omegatro/assets/1x/alphonse.png",
             "crunched": 0,
-            "start": 45258026,
-            "end": 45258236,
+            "start": 39227289,
+            "end": 39239322,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/layers/mutator_stubs.lua",
+            "filename": "/Mods/Omegatro/assets/1x/arrowace.png",
             "crunched": 0,
-            "start": 45258236,
-            "end": 45258490,
+            "start": 39239322,
+            "end": 39240238,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/layers/no_anim_timer.lua",
+            "filename": "/Mods/Omegatro/assets/1x/backpack.png",
             "crunched": 0,
-            "start": 45258490,
-            "end": 45258628,
+            "start": 39240238,
+            "end": 39242224,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/layers/no_red_seals.lua",
+            "filename": "/Mods/Omegatro/assets/1x/bad_apple.png",
             "crunched": 0,
-            "start": 45258628,
-            "end": 45259574,
+            "start": 39242224,
+            "end": 39243228,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/layers/polymorph_spam.lua",
+            "filename": "/Mods/Omegatro/assets/1x/bea.png",
             "crunched": 0,
-            "start": 45259574,
-            "end": 45263753,
+            "start": 39243228,
+            "end": 39254744,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/layers/pressure_timer.lua",
+            "filename": "/Mods/Omegatro/assets/1x/bluegem.png",
             "crunched": 0,
-            "start": 45263753,
-            "end": 45264285,
+            "start": 39254744,
+            "end": 39258392,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/layers/pvp_timer.lua",
+            "filename": "/Mods/Omegatro/assets/1x/bro_has_the_key.png",
             "crunched": 0,
-            "start": 45264285,
-            "end": 45264389,
+            "start": 39258392,
+            "end": 39259537,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/layers/ranked.lua",
+            "filename": "/Mods/Omegatro/assets/1x/caixinha.png",
             "crunched": 0,
-            "start": 45264389,
-            "end": 45264650,
+            "start": 39259537,
+            "end": 39265008,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/layers/release.lua",
+            "filename": "/Mods/Omegatro/assets/1x/calculator.png",
             "crunched": 0,
-            "start": 45264650,
-            "end": 45264741,
+            "start": 39265008,
+            "end": 39268278,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/layers/sandbox.lua",
+            "filename": "/Mods/Omegatro/assets/1x/calculator2.png",
             "crunched": 0,
-            "start": 45264741,
-            "end": 45273479,
+            "start": 39268278,
+            "end": 39269347,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/layers/score_instability.lua",
+            "filename": "/Mods/Omegatro/assets/1x/chatgpt.png",
             "crunched": 0,
-            "start": 45273479,
-            "end": 45275526,
+            "start": 39269347,
+            "end": 39276519,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/layers/shared_pockets.lua",
+            "filename": "/Mods/Omegatro/assets/1x/cinder_block.png",
             "crunched": 0,
-            "start": 45275526,
-            "end": 45278169,
+            "start": 39276519,
+            "end": 39277715,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/layers/shop_mutators.lua",
+            "filename": "/Mods/Omegatro/assets/1x/coloring_book.png",
             "crunched": 0,
-            "start": 45278169,
-            "end": 45278254,
+            "start": 39277715,
+            "end": 39283039,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/layers/smallworld.lua",
+            "filename": "/Mods/Omegatro/assets/1x/concrete.png",
             "crunched": 0,
-            "start": 45278254,
-            "end": 45283361,
+            "start": 39283039,
+            "end": 39284812,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/layers/speedlatro_timer.lua",
+            "filename": "/Mods/Omegatro/assets/1x/crafting_table.png",
             "crunched": 0,
-            "start": 45283361,
-            "end": 45288593,
+            "start": 39284812,
+            "end": 39287159,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/layers/standard.lua",
+            "filename": "/Mods/Omegatro/assets/1x/crafting_voucher.png",
             "crunched": 0,
-            "start": 45288593,
-            "end": 45289149,
+            "start": 39287159,
+            "end": 39288023,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/layers/wraith_rework.lua",
+            "filename": "/Mods/Omegatro/assets/1x/creditcard_inbuffonpack.png",
             "crunched": 0,
-            "start": 45289149,
-            "end": 45289343,
+            "start": 39288023,
+            "end": 39290624,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/lib/_init.lua",
+            "filename": "/Mods/Omegatro/assets/1x/cryptid_reference.png",
             "crunched": 0,
-            "start": 45289343,
-            "end": 45289357,
+            "start": 39290624,
+            "end": 39293708,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/lib/_table_utils.lua",
+            "filename": "/Mods/Omegatro/assets/1x/d100.png",
             "crunched": 0,
-            "start": 45289357,
-            "end": 45290931,
+            "start": 39293708,
+            "end": 39302840,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/lib/blind_utils.lua",
+            "filename": "/Mods/Omegatro/assets/1x/diamond_tester.png",
             "crunched": 0,
-            "start": 45290931,
-            "end": 45291555,
+            "start": 39302840,
+            "end": 39303664,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/lib/card_utils.lua",
+            "filename": "/Mods/Omegatro/assets/1x/diamond.png",
             "crunched": 0,
-            "start": 45291555,
-            "end": 45298339,
+            "start": 39303664,
+            "end": 39306319,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/lib/crypto.lua",
+            "filename": "/Mods/Omegatro/assets/1x/disco.png",
             "crunched": 0,
-            "start": 45298339,
-            "end": 45300507,
+            "start": 39306319,
+            "end": 39315733,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/lib/debug_utils.lua",
+            "filename": "/Mods/Omegatro/assets/1x/dubai_chocolate.png",
             "crunched": 0,
-            "start": 45300507,
-            "end": 45301255,
+            "start": 39315733,
+            "end": 39317031,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/lib/ghost_replay.lua",
+            "filename": "/Mods/Omegatro/assets/1x/embed_fail_card.png",
             "crunched": 0,
-            "start": 45301255,
-            "end": 45313472,
+            "start": 39317031,
+            "end": 39317624,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/lib/insane_int.lua",
+            "filename": "/Mods/Omegatro/assets/1x/embed_fail.png",
             "crunched": 0,
-            "start": 45313472,
-            "end": 45317651,
+            "start": 39317624,
+            "end": 39318460,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/lib/joker_stats.lua",
+            "filename": "/Mods/Omegatro/assets/1x/epic_games.png",
             "crunched": 0,
-            "start": 45317651,
-            "end": 45318922,
+            "start": 39318460,
+            "end": 39319195,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/lib/log_parser.lua",
+            "filename": "/Mods/Omegatro/assets/1x/error.png",
             "crunched": 0,
-            "start": 45318922,
-            "end": 45332165,
+            "start": 39319195,
+            "end": 39320619,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/lib/matchmaking.lua",
+            "filename": "/Mods/Omegatro/assets/1x/fake_png.png",
             "crunched": 0,
-            "start": 45332165,
-            "end": 45341263,
+            "start": 39320619,
+            "end": 39321883,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/lib/practice_mode.lua",
+            "filename": "/Mods/Omegatro/assets/1x/formula.png",
             "crunched": 0,
-            "start": 45341263,
-            "end": 45343353,
+            "start": 39321883,
+            "end": 39323053,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/lib/replay_log.lua",
+            "filename": "/Mods/Omegatro/assets/1x/fortnite.png",
             "crunched": 0,
-            "start": 45343353,
-            "end": 45352878,
+            "start": 39323053,
+            "end": 39329561,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/lib/ruleset_utils.lua",
+            "filename": "/Mods/Omegatro/assets/1x/foto.png",
             "crunched": 0,
-            "start": 45352878,
-            "end": 45355020,
+            "start": 39329561,
+            "end": 39330774,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/lib/serialization.lua",
+            "filename": "/Mods/Omegatro/assets/1x/foto2.png",
             "crunched": 0,
-            "start": 45355020,
-            "end": 45357819,
+            "start": 39330774,
+            "end": 39343229,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/lib/settings_utils.lua",
+            "filename": "/Mods/Omegatro/assets/1x/free_wifi.png",
             "crunched": 0,
-            "start": 45357819,
-            "end": 45357819,
+            "start": 39343229,
+            "end": 39344142,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/lib/string_utils.lua",
+            "filename": "/Mods/Omegatro/assets/1x/frutiger_aero.png",
             "crunched": 0,
-            "start": 45357819,
-            "end": 45358603,
+            "start": 39344142,
+            "end": 39358753,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/lib/ui.lua",
+            "filename": "/Mods/Omegatro/assets/1x/fuckass_dog.png",
             "crunched": 0,
-            "start": 45358603,
-            "end": 45361657,
+            "start": 39358753,
+            "end": 39375320,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/LICENSE.md",
+            "filename": "/Mods/Omegatro/assets/1x/gambling.png",
             "crunched": 0,
-            "start": 45361657,
-            "end": 45396806,
+            "start": 39375320,
+            "end": 39377448,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/localization/de.lua",
+            "filename": "/Mods/Omegatro/assets/1x/gaster.png",
             "crunched": 0,
-            "start": 45396806,
-            "end": 45405824,
+            "start": 39377448,
+            "end": 39383727,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/localization/en-us.lua",
+            "filename": "/Mods/Omegatro/assets/1x/golden_cookie.png",
             "crunched": 0,
-            "start": 45405824,
-            "end": 45456933,
+            "start": 39383727,
+            "end": 39396804,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/localization/es_419.lua",
+            "filename": "/Mods/Omegatro/assets/1x/goodbelisk.png",
             "crunched": 0,
-            "start": 45456933,
-            "end": 45493087,
+            "start": 39396804,
+            "end": 39402886,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/localization/es_ES.lua",
+            "filename": "/Mods/Omegatro/assets/1x/gravestone.png",
             "crunched": 0,
-            "start": 45493087,
-            "end": 45505871,
+            "start": 39402886,
+            "end": 39413617,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/localization/fr.lua",
+            "filename": "/Mods/Omegatro/assets/1x/greg_materials.png",
             "crunched": 0,
-            "start": 45505871,
-            "end": 45519620,
+            "start": 39413617,
+            "end": 39425829,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/localization/it.lua",
+            "filename": "/Mods/Omegatro/assets/1x/greg_pack.png",
             "crunched": 0,
-            "start": 45519620,
-            "end": 45547413,
+            "start": 39425829,
+            "end": 39433321,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/localization/ja.lua",
+            "filename": "/Mods/Omegatro/assets/1x/gregdeck.png",
             "crunched": 0,
-            "start": 45547413,
-            "end": 45581669,
+            "start": 39433321,
+            "end": 39439125,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/localization/ko.lua",
+            "filename": "/Mods/Omegatro/assets/1x/gregorius.png",
             "crunched": 0,
-            "start": 45581669,
-            "end": 45615075,
+            "start": 39439125,
+            "end": 39440186,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/localization/mi.lua",
+            "filename": "/Mods/Omegatro/assets/1x/h&s.png",
             "crunched": 0,
-            "start": 45615075,
-            "end": 45625203,
+            "start": 39440186,
+            "end": 39441994,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/localization/nl.lua",
+            "filename": "/Mods/Omegatro/assets/1x/HTML_pro.png",
             "crunched": 0,
-            "start": 45625203,
-            "end": 45638803,
+            "start": 39441994,
+            "end": 39443212,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/localization/pl.lua",
+            "filename": "/Mods/Omegatro/assets/1x/icon.png",
             "crunched": 0,
-            "start": 45638803,
-            "end": 45651702,
+            "start": 39443212,
+            "end": 39443944,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/localization/pt_BR.lua",
+            "filename": "/Mods/Omegatro/assets/1x/infinity.png",
             "crunched": 0,
-            "start": 45651702,
-            "end": 45666686,
+            "start": 39443944,
+            "end": 39445974,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/localization/ru.lua",
+            "filename": "/Mods/Omegatro/assets/1x/job.png",
             "crunched": 0,
-            "start": 45666686,
-            "end": 45735722,
+            "start": 39445974,
+            "end": 39448538,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/localization/stylua.toml",
+            "filename": "/Mods/Omegatro/assets/1x/jumbo_omega_pack.png",
             "crunched": 0,
-            "start": 45735722,
-            "end": 45735856,
+            "start": 39448538,
+            "end": 39451989,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/localization/vi.lua",
+            "filename": "/Mods/Omegatro/assets/1x/jv.png",
             "crunched": 0,
-            "start": 45735856,
-            "end": 45781499,
+            "start": 39451989,
+            "end": 39461398,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/localization/zh_CN.lua",
+            "filename": "/Mods/Omegatro/assets/1x/keep_gambling.png",
             "crunched": 0,
-            "start": 45781499,
-            "end": 45798890,
+            "start": 39461398,
+            "end": 39474305,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/localization/zh_TW.lua",
+            "filename": "/Mods/Omegatro/assets/1x/labubu_joker.png",
             "crunched": 0,
-            "start": 45798890,
-            "end": 45801812,
+            "start": 39474305,
+            "end": 39485232,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/lovely/cards.toml",
+            "filename": "/Mods/Omegatro/assets/1x/le_triangle.png",
             "crunched": 0,
-            "start": 45801812,
-            "end": 45804399,
+            "start": 39485232,
+            "end": 39497392,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/lovely/ce.toml",
+            "filename": "/Mods/Omegatro/assets/1x/local58.png",
             "crunched": 0,
-            "start": 45804399,
-            "end": 45805366,
+            "start": 39497392,
+            "end": 39506501,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/lovely/challenges.toml",
+            "filename": "/Mods/Omegatro/assets/1x/loss.png",
             "crunched": 0,
-            "start": 45805366,
-            "end": 45806200,
+            "start": 39506501,
+            "end": 39507096,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/lovely/compatibility.toml",
+            "filename": "/Mods/Omegatro/assets/1x/mega_omega_pack.png",
             "crunched": 0,
-            "start": 45806200,
-            "end": 45806811,
+            "start": 39507096,
+            "end": 39510839,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/lovely/deck_select.toml",
+            "filename": "/Mods/Omegatro/assets/1x/minecraft.png",
             "crunched": 0,
-            "start": 45806811,
-            "end": 45809637,
+            "start": 39510839,
+            "end": 39512529,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/lovely/decks.toml",
+            "filename": "/Mods/Omegatro/assets/1x/mmorpg.png",
             "crunched": 0,
-            "start": 45809637,
-            "end": 45810594,
+            "start": 39512529,
+            "end": 39513739,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/lovely/double_emplace.toml",
+            "filename": "/Mods/Omegatro/assets/1x/moche.png",
             "crunched": 0,
-            "start": 45810594,
-            "end": 45811866,
+            "start": 39513739,
+            "end": 39528205,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/lovely/end_round.toml",
+            "filename": "/Mods/Omegatro/assets/1x/ms_paint.png",
             "crunched": 0,
-            "start": 45811866,
-            "end": 45817216,
+            "start": 39528205,
+            "end": 39532774,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/lovely/game.toml",
+            "filename": "/Mods/Omegatro/assets/1x/multiple_choice.png",
             "crunched": 0,
-            "start": 45817216,
-            "end": 45822791,
+            "start": 39532774,
+            "end": 39534010,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/lovely/hud.toml",
+            "filename": "/Mods/Omegatro/assets/1x/negation.png",
             "crunched": 0,
-            "start": 45822791,
-            "end": 45825959,
+            "start": 39534010,
+            "end": 39535247,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/lovely/misc.toml",
+            "filename": "/Mods/Omegatro/assets/1x/netherite.png",
             "crunched": 0,
-            "start": 45825959,
-            "end": 45832495,
+            "start": 39535247,
+            "end": 39536163,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/lovely/pause.toml",
+            "filename": "/Mods/Omegatro/assets/1x/nft.png",
             "crunched": 0,
-            "start": 45832495,
-            "end": 45834245,
+            "start": 39536163,
+            "end": 39537551,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/lovely/practice.toml",
+            "filename": "/Mods/Omegatro/assets/1x/nuke.png",
             "crunched": 0,
-            "start": 45834245,
-            "end": 45837245,
+            "start": 39537551,
+            "end": 39542588,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/lovely/preview.toml",
+            "filename": "/Mods/Omegatro/assets/1x/obsidian.png",
             "crunched": 0,
-            "start": 45837245,
-            "end": 45838174,
+            "start": 39542588,
+            "end": 39550431,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/lovely/rework-center.toml",
+            "filename": "/Mods/Omegatro/assets/1x/omega_deck.png",
             "crunched": 0,
-            "start": 45838174,
-            "end": 45839519,
+            "start": 39550431,
+            "end": 39552544,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/lovely/shared_area.toml",
+            "filename": "/Mods/Omegatro/assets/1x/omega_joker.png",
             "crunched": 0,
-            "start": 45839519,
-            "end": 45840369,
+            "start": 39552544,
+            "end": 39558353,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/lovely/stakes.toml",
+            "filename": "/Mods/Omegatro/assets/1x/omega_pack.png",
             "crunched": 0,
-            "start": 45840369,
-            "end": 45842695,
+            "start": 39558353,
+            "end": 39561363,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/lovely/TheOrder.toml",
+            "filename": "/Mods/Omegatro/assets/1x/omega_suit.png",
             "crunched": 0,
-            "start": 45842695,
-            "end": 45850610,
+            "start": 39561363,
+            "end": 39579613,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/lovely/timer.toml",
+            "filename": "/Mods/Omegatro/assets/1x/omega_ui.png",
             "crunched": 0,
-            "start": 45850610,
-            "end": 45851120,
+            "start": 39579613,
+            "end": 39580132,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/lovely/view_deck.toml",
+            "filename": "/Mods/Omegatro/assets/1x/omega_voucher.png",
             "crunched": 0,
-            "start": 45851120,
-            "end": 45852037,
+            "start": 39580132,
+            "end": 39581591,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/Multiplayer.json",
+            "filename": "/Mods/Omegatro/assets/1x/optimally_packed.png",
             "crunched": 0,
-            "start": 45852037,
-            "end": 45852667,
+            "start": 39581591,
+            "end": 39582532,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/networking/action_handlers.lua",
+            "filename": "/Mods/Omegatro/assets/1x/os_maias.png",
             "crunched": 0,
-            "start": 45852667,
-            "end": 45899548,
+            "start": 39582532,
+            "end": 39583996,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/networking/socket.lua",
+            "filename": "/Mods/Omegatro/assets/1x/pass.png",
             "crunched": 0,
-            "start": 45899548,
-            "end": 45906048,
+            "start": 39583996,
+            "end": 39584763,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/objects/blinds/nemesis.lua",
+            "filename": "/Mods/Omegatro/assets/1x/pegi18.png",
             "crunched": 0,
-            "start": 45906048,
-            "end": 45906801,
+            "start": 39584763,
+            "end": 39585456,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/objects/boosters/standard_giga.lua",
+            "filename": "/Mods/Omegatro/assets/1x/petrification_device.png",
             "crunched": 0,
-            "start": 45906801,
-            "end": 45907986,
+            "start": 39585456,
+            "end": 39592218,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/objects/challenges/all_must_go.lua",
+            "filename": "/Mods/Omegatro/assets/1x/phone.png",
             "crunched": 0,
-            "start": 45907986,
-            "end": 45908174,
+            "start": 39592218,
+            "end": 39640070,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/objects/challenges/bacon.lua",
+            "filename": "/Mods/Omegatro/assets/1x/photograph_fixed.png",
             "crunched": 0,
-            "start": 45908174,
-            "end": 45909316,
+            "start": 39640070,
+            "end": 39648938,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/objects/challenges/balancing_act.lua",
+            "filename": "/Mods/Omegatro/assets/1x/pi.png",
             "crunched": 0,
-            "start": 45909316,
-            "end": 45909823,
+            "start": 39648938,
+            "end": 39654476,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/objects/challenges/chore_list.lua",
+            "filename": "/Mods/Omegatro/assets/1x/prophecy.png",
             "crunched": 0,
-            "start": 45909823,
-            "end": 45910608,
+            "start": 39654476,
+            "end": 39665366,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/objects/challenges/divination.lua",
+            "filename": "/Mods/Omegatro/assets/1x/rabbit_clock.png",
             "crunched": 0,
-            "start": 45910608,
-            "end": 45910754,
+            "start": 39665366,
+            "end": 39666756,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/objects/challenges/eeeee.lua",
+            "filename": "/Mods/Omegatro/assets/1x/rainbow.png",
             "crunched": 0,
-            "start": 45910754,
-            "end": 45910980,
+            "start": 39666756,
+            "end": 39667907,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/objects/challenges/high_hand.lua",
+            "filename": "/Mods/Omegatro/assets/1x/reboot_card.png",
             "crunched": 0,
-            "start": 45910980,
-            "end": 45911279,
+            "start": 39667907,
+            "end": 39672061,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/objects/challenges/in_the_red.lua",
+            "filename": "/Mods/Omegatro/assets/1x/redacted.png",
             "crunched": 0,
-            "start": 45911279,
-            "end": 45911673,
+            "start": 39672061,
+            "end": 39672967,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/objects/challenges/legendaries.lua",
+            "filename": "/Mods/Omegatro/assets/1x/reinforced.png",
             "crunched": 0,
-            "start": 45911673,
-            "end": 45912288,
+            "start": 39672967,
+            "end": 39673956,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/objects/challenges/lets_go_gambling.lua",
+            "filename": "/Mods/Omegatro/assets/1x/rigged.png",
             "crunched": 0,
-            "start": 45912288,
-            "end": 45913289,
+            "start": 39673956,
+            "end": 39681761,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/objects/challenges/misprint_deck.lua",
+            "filename": "/Mods/Omegatro/assets/1x/rixy.png",
             "crunched": 0,
-            "start": 45913289,
-            "end": 45913526,
+            "start": 39681761,
+            "end": 39692747,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/objects/challenges/oops_all_jokers.lua",
+            "filename": "/Mods/Omegatro/assets/1x/rtl.png",
             "crunched": 0,
-            "start": 45913526,
-            "end": 45914728,
+            "start": 39692747,
+            "end": 39693987,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/objects/challenges/planet_tycoon.lua",
+            "filename": "/Mods/Omegatro/assets/1x/scaling.png",
             "crunched": 0,
-            "start": 45914728,
-            "end": 45915129,
+            "start": 39693987,
+            "end": 39695298,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/objects/challenges/polymorph_spam.lua",
+            "filename": "/Mods/Omegatro/assets/1x/sigil_joker.png",
             "crunched": 0,
-            "start": 45915129,
-            "end": 45915802,
+            "start": 39695298,
+            "end": 39696247,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/objects/challenges/psychosis.lua",
+            "filename": "/Mods/Omegatro/assets/1x/sigil.png",
             "crunched": 0,
-            "start": 45915802,
-            "end": 45915946,
+            "start": 39696247,
+            "end": 39697132,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/objects/challenges/salvaged_sibyl.lua",
+            "filename": "/Mods/Omegatro/assets/1x/simp.png",
             "crunched": 0,
-            "start": 45915946,
-            "end": 45918026,
+            "start": 39697132,
+            "end": 39702748,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/objects/challenges/scratch.lua",
+            "filename": "/Mods/Omegatro/assets/1x/slothful.png",
             "crunched": 0,
-            "start": 45918026,
-            "end": 45918293,
+            "start": 39702748,
+            "end": 39707255,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/objects/challenges/shared_pockets.lua",
+            "filename": "/Mods/Omegatro/assets/1x/squared.png",
             "crunched": 0,
-            "start": 45918293,
-            "end": 45918667,
+            "start": 39707255,
+            "end": 39713185,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/objects/challenges/skip_off.lua",
+            "filename": "/Mods/Omegatro/assets/1x/star_sticker.png",
             "crunched": 0,
-            "start": 45918667,
-            "end": 45918856,
+            "start": 39713185,
+            "end": 39713747,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/objects/challenges/speed.lua",
+            "filename": "/Mods/Omegatro/assets/1x/swapping.png",
             "crunched": 0,
-            "start": 45918856,
-            "end": 45919095,
+            "start": 39713747,
+            "end": 39716853,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/objects/challenges/twin_towers.lua",
+            "filename": "/Mods/Omegatro/assets/1x/template thunder.png",
             "crunched": 0,
-            "start": 45919095,
-            "end": 45919281,
+            "start": 39716853,
+            "end": 39718334,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/objects/challenges/vantablack.lua",
+            "filename": "/Mods/Omegatro/assets/1x/thatcher.png",
             "crunched": 0,
-            "start": 45919281,
-            "end": 45919649,
+            "start": 39718334,
+            "end": 39719518,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/objects/consumables/asteroid.lua",
+            "filename": "/Mods/Omegatro/assets/1x/the_gathering.png",
             "crunched": 0,
-            "start": 45919649,
-            "end": 45921099,
+            "start": 39719518,
+            "end": 39721038,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/objects/consumables/judgement.lua",
+            "filename": "/Mods/Omegatro/assets/1x/the_solo.png",
             "crunched": 0,
-            "start": 45921099,
-            "end": 45923565,
+            "start": 39721038,
+            "end": 39722527,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/objects/consumables/ouija.lua",
+            "filename": "/Mods/Omegatro/assets/1x/the_squad.png",
             "crunched": 0,
-            "start": 45923565,
-            "end": 45926084,
+            "start": 39722527,
+            "end": 39724032,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/objects/consumables/sandbox/ectoplasm.lua",
+            "filename": "/Mods/Omegatro/assets/1x/the_twins.png",
             "crunched": 0,
-            "start": 45926084,
-            "end": 45927778,
+            "start": 39724032,
+            "end": 39725556,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/objects/consumables/wraith.lua",
+            "filename": "/Mods/Omegatro/assets/1x/titlescreen.png",
             "crunched": 0,
-            "start": 45927778,
-            "end": 45928684,
+            "start": 39725556,
+            "end": 39727241,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/objects/decks/_decks.lua",
+            "filename": "/Mods/Omegatro/assets/1x/toilet_paper.png",
             "crunched": 0,
-            "start": 45928684,
-            "end": 45929714,
+            "start": 39727241,
+            "end": 39732916,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/objects/decks/00_violet.lua",
+            "filename": "/Mods/Omegatro/assets/1x/tycoon.png",
             "crunched": 0,
-            "start": 45929714,
-            "end": 45930545,
+            "start": 39732916,
+            "end": 39733957,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/objects/decks/01_indigo.lua",
+            "filename": "/Mods/Omegatro/assets/1x/unope_pack.png",
             "crunched": 0,
-            "start": 45930545,
-            "end": 45933600,
+            "start": 39733957,
+            "end": 39735660,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/objects/decks/02_orange.lua",
+            "filename": "/Mods/Omegatro/assets/1x/upgrade.png",
             "crunched": 0,
-            "start": 45933600,
-            "end": 45934871,
+            "start": 39735660,
+            "end": 39736962,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/objects/decks/09_white.lua",
+            "filename": "/Mods/Omegatro/assets/1x/upgraded_deck.png",
             "crunched": 0,
-            "start": 45934871,
-            "end": 45935857,
+            "start": 39736962,
+            "end": 39739218,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/objects/decks/AA_oracle.lua",
+            "filename": "/Mods/Omegatro/assets/1x/verity_mad.png",
             "crunched": 0,
-            "start": 45935857,
-            "end": 45936654,
+            "start": 39739218,
+            "end": 39742725,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/objects/decks/BB_gradient.lua",
+            "filename": "/Mods/Omegatro/assets/1x/verity.png",
             "crunched": 0,
-            "start": 45936654,
-            "end": 45942192,
+            "start": 39742725,
+            "end": 39746219,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/objects/decks/CC_heidelberg.lua",
+            "filename": "/Mods/Omegatro/assets/1x/waffle.png",
             "crunched": 0,
-            "start": 45942192,
-            "end": 45942912,
+            "start": 39746219,
+            "end": 39759801,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/objects/decks/EC_echo_deck.lua",
+            "filename": "/Mods/Omegatro/assets/1x/webdriver.png",
             "crunched": 0,
-            "start": 45942912,
-            "end": 45944261,
+            "start": 39759801,
+            "end": 39760414,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/objects/decks/ZZ_cocktail.lua",
+            "filename": "/Mods/Omegatro/assets/1x/wild.png",
             "crunched": 0,
-            "start": 45944261,
-            "end": 45963625,
+            "start": 39760414,
+            "end": 39767108,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/objects/editions/phantom.lua",
+            "filename": "/Mods/Omegatro/assets/1x/wind.png",
             "crunched": 0,
-            "start": 45963625,
-            "end": 45964772,
+            "start": 39767108,
+            "end": 39776007,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/objects/enhancements/mp_glass.lua",
+            "filename": "/Mods/Omegatro/assets/1x/windtrackball.png",
             "crunched": 0,
-            "start": 45964772,
-            "end": 45964979,
+            "start": 39776007,
+            "end": 39776960,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/objects/jokers/conjoined_joker.lua",
+            "filename": "/Mods/Omegatro/assets/1x/wordle.png",
             "crunched": 0,
-            "start": 45964979,
-            "end": 45966782,
+            "start": 39776960,
+            "end": 39778000,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/objects/jokers/defensive_joker.lua",
+            "filename": "/Mods/Omegatro/assets/1x/yeah.png",
             "crunched": 0,
-            "start": 45966782,
-            "end": 45968179,
+            "start": 39778000,
+            "end": 39781851,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/objects/jokers/experimental/baron_uncommon.lua",
+            "filename": "/Mods/Omegatro/assets/2x/👀.png",
             "crunched": 0,
-            "start": 45968179,
-            "end": 45968906,
+            "start": 39781851,
+            "end": 39783308,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/objects/jokers/experimental/idol_rare.lua",
+            "filename": "/Mods/Omegatro/assets/2x/all_in.png",
             "crunched": 0,
-            "start": 45968906,
-            "end": 45969840,
+            "start": 39783308,
+            "end": 39797904,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/objects/jokers/experimental/mime_rare.lua",
+            "filename": "/Mods/Omegatro/assets/2x/alphonse.png",
             "crunched": 0,
-            "start": 45969840,
-            "end": 45970328,
+            "start": 39797904,
+            "end": 39813402,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/objects/jokers/experimental/todo_list.lua",
+            "filename": "/Mods/Omegatro/assets/2x/arrowace.png",
             "crunched": 0,
-            "start": 45970328,
-            "end": 45971941,
+            "start": 39813402,
+            "end": 39814527,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/objects/jokers/lets_go_gambling.lua",
+            "filename": "/Mods/Omegatro/assets/2x/backpack.png",
             "crunched": 0,
-            "start": 45971941,
-            "end": 45974226,
+            "start": 39814527,
+            "end": 39818305,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/objects/jokers/pacifist.lua",
+            "filename": "/Mods/Omegatro/assets/2x/bea.png",
             "crunched": 0,
-            "start": 45974226,
-            "end": 45975038,
+            "start": 39818305,
+            "end": 39833251,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/objects/jokers/penny_pincher.lua",
+            "filename": "/Mods/Omegatro/assets/2x/bluegem.png",
             "crunched": 0,
-            "start": 45975038,
-            "end": 45976164,
+            "start": 39833251,
+            "end": 39839923,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/objects/jokers/pizza.lua",
+            "filename": "/Mods/Omegatro/assets/2x/bro_has_the_key.png",
             "crunched": 0,
-            "start": 45976164,
-            "end": 45977866,
+            "start": 39839923,
+            "end": 39841318,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/objects/jokers/sandbox/baseball.lua",
+            "filename": "/Mods/Omegatro/assets/2x/caixinha.png",
             "crunched": 0,
-            "start": 45977866,
-            "end": 45978718,
+            "start": 39841318,
+            "end": 39848728,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/objects/jokers/sandbox/bloodstone.lua",
+            "filename": "/Mods/Omegatro/assets/2x/calculator.png",
             "crunched": 0,
-            "start": 45978718,
-            "end": 45979825,
+            "start": 39848728,
+            "end": 39852694,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/objects/jokers/sandbox/castle.lua",
+            "filename": "/Mods/Omegatro/assets/2x/calculator2.png",
             "crunched": 0,
-            "start": 45979825,
-            "end": 45981300,
+            "start": 39852694,
+            "end": 39854145,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/objects/jokers/sandbox/cloud_9.lua",
+            "filename": "/Mods/Omegatro/assets/2x/chatgpt.png",
             "crunched": 0,
-            "start": 45981300,
-            "end": 45983012,
+            "start": 39854145,
+            "end": 39863794,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/objects/jokers/sandbox/constellation.lua",
+            "filename": "/Mods/Omegatro/assets/2x/cinder_block.png",
             "crunched": 0,
-            "start": 45983012,
-            "end": 45984627,
+            "start": 39863794,
+            "end": 39865280,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/objects/jokers/sandbox/error.lua",
+            "filename": "/Mods/Omegatro/assets/2x/coloring_book.png",
             "crunched": 0,
-            "start": 45984627,
-            "end": 45989355,
+            "start": 39865280,
+            "end": 39872173,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/objects/jokers/sandbox/extra-credit/_ec_atlas.lua",
+            "filename": "/Mods/Omegatro/assets/2x/concrete.png",
             "crunched": 0,
-            "start": 45989355,
-            "end": 45989718,
+            "start": 39872173,
+            "end": 39874555,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/objects/jokers/sandbox/extra-credit/_ec_utils.lua",
+            "filename": "/Mods/Omegatro/assets/2x/crafting_table.png",
             "crunched": 0,
-            "start": 45989718,
-            "end": 45993050,
+            "start": 39874555,
+            "end": 39879131,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/objects/jokers/sandbox/extra-credit/alloy.lua",
+            "filename": "/Mods/Omegatro/assets/2x/crafting_voucher.png",
             "crunched": 0,
-            "start": 45993050,
-            "end": 45993950,
+            "start": 39879131,
+            "end": 39880244,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/objects/jokers/sandbox/extra-credit/ambrosia.lua",
+            "filename": "/Mods/Omegatro/assets/2x/creditcard_inbuffonpack.png",
             "crunched": 0,
-            "start": 45993950,
-            "end": 45996178,
+            "start": 39880244,
+            "end": 39883393,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/objects/jokers/sandbox/extra-credit/bobby.lua",
+            "filename": "/Mods/Omegatro/assets/2x/cryptid_reference.png",
             "crunched": 0,
-            "start": 45996178,
-            "end": 45997933,
+            "start": 39883393,
+            "end": 39898515,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/objects/jokers/sandbox/extra-credit/candynecklace.lua",
+            "filename": "/Mods/Omegatro/assets/2x/d100.png",
             "crunched": 0,
-            "start": 45997933,
-            "end": 45999740,
+            "start": 39898515,
+            "end": 39927535,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/objects/jokers/sandbox/extra-credit/chainlightning.lua",
+            "filename": "/Mods/Omegatro/assets/2x/diamond.png",
             "crunched": 0,
-            "start": 45999740,
-            "end": 46001224,
+            "start": 39927535,
+            "end": 39931361,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/objects/jokers/sandbox/extra-credit/clowncar.lua",
+            "filename": "/Mods/Omegatro/assets/2x/disco.png",
             "crunched": 0,
-            "start": 46001224,
-            "end": 46002222,
+            "start": 39931361,
+            "end": 39963926,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/objects/jokers/sandbox/extra-credit/clowncollege.lua",
+            "filename": "/Mods/Omegatro/assets/2x/dubai_chocolate.png",
             "crunched": 0,
-            "start": 46002222,
-            "end": 46003907,
+            "start": 39963926,
+            "end": 39965590,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/objects/jokers/sandbox/extra-credit/couponsheet.lua",
+            "filename": "/Mods/Omegatro/assets/2x/embed_fail_card.png",
             "crunched": 0,
-            "start": 46003907,
-            "end": 46005630,
+            "start": 39965590,
+            "end": 39966328,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/objects/jokers/sandbox/extra-credit/doublerainbow.lua",
+            "filename": "/Mods/Omegatro/assets/2x/embed_fail.png",
             "crunched": 0,
-            "start": 46005630,
-            "end": 46006957,
+            "start": 39966328,
+            "end": 39967381,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/objects/jokers/sandbox/extra-credit/espresso.lua",
+            "filename": "/Mods/Omegatro/assets/2x/epic_games.png",
             "crunched": 0,
-            "start": 46006957,
-            "end": 46009517,
+            "start": 39967381,
+            "end": 39968439,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/objects/jokers/sandbox/extra-credit/farmer.lua",
+            "filename": "/Mods/Omegatro/assets/2x/error.png",
             "crunched": 0,
-            "start": 46009517,
-            "end": 46010655,
+            "start": 39968439,
+            "end": 39971479,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/objects/jokers/sandbox/extra-credit/forklift.lua",
+            "filename": "/Mods/Omegatro/assets/2x/formula.png",
             "crunched": 0,
-            "start": 46010655,
-            "end": 46011814,
+            "start": 39971479,
+            "end": 39972904,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/objects/jokers/sandbox/extra-credit/gofish.lua",
+            "filename": "/Mods/Omegatro/assets/2x/fortnite.png",
             "crunched": 0,
-            "start": 46011814,
-            "end": 46013475,
+            "start": 39972904,
+            "end": 39981531,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/objects/jokers/sandbox/extra-credit/hoarder.lua",
+            "filename": "/Mods/Omegatro/assets/2x/foto.png",
             "crunched": 0,
-            "start": 46013475,
-            "end": 46014063,
+            "start": 39981531,
+            "end": 39982997,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/objects/jokers/sandbox/extra-credit/jokalisa.lua",
+            "filename": "/Mods/Omegatro/assets/2x/foto2.png",
             "crunched": 0,
-            "start": 46014063,
-            "end": 46015801,
+            "start": 39982997,
+            "end": 40000144,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/objects/jokers/sandbox/extra-credit/jokeroftheyear.lua",
+            "filename": "/Mods/Omegatro/assets/2x/free_wifi.png",
             "crunched": 0,
-            "start": 46015801,
-            "end": 46016634,
+            "start": 40000144,
+            "end": 40001287,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/objects/jokers/sandbox/extra-credit/lucky7.lua",
+            "filename": "/Mods/Omegatro/assets/2x/frutiger_aero.png",
             "crunched": 0,
-            "start": 46016634,
-            "end": 46018168,
+            "start": 40001287,
+            "end": 40020605,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/objects/jokers/sandbox/extra-credit/montehaul.lua",
+            "filename": "/Mods/Omegatro/assets/2x/fuckass_dog.png",
             "crunched": 0,
-            "start": 46018168,
-            "end": 46020300,
+            "start": 40020605,
+            "end": 40077450,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/objects/jokers/sandbox/extra-credit/pocketaces.lua",
+            "filename": "/Mods/Omegatro/assets/2x/gambling.png",
             "crunched": 0,
-            "start": 46020300,
-            "end": 46021520,
+            "start": 40077450,
+            "end": 40079919,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/objects/jokers/sandbox/extra-credit/pyromancer.lua",
+            "filename": "/Mods/Omegatro/assets/2x/gaster.png",
             "crunched": 0,
-            "start": 46021520,
-            "end": 46022480,
+            "start": 40079919,
+            "end": 40088583,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/objects/jokers/sandbox/extra-credit/shipoftheseus.lua",
+            "filename": "/Mods/Omegatro/assets/2x/golden_cookie.png",
             "crunched": 0,
-            "start": 46022480,
-            "end": 46024697,
+            "start": 40088583,
+            "end": 40107152,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/objects/jokers/sandbox/extra-credit/starfruit.lua",
+            "filename": "/Mods/Omegatro/assets/2x/goodbelisk.png",
             "crunched": 0,
-            "start": 46024697,
-            "end": 46027088,
+            "start": 40107152,
+            "end": 40115254,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/objects/jokers/sandbox/extra-credit/trafficlight.lua",
+            "filename": "/Mods/Omegatro/assets/2x/gravestone.png",
             "crunched": 0,
-            "start": 46027088,
-            "end": 46028860,
+            "start": 40115254,
+            "end": 40133338,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/objects/jokers/sandbox/extra-credit/tuxedo.lua",
+            "filename": "/Mods/Omegatro/assets/2x/greg_materials.png",
             "crunched": 0,
-            "start": 46028860,
-            "end": 46030266,
+            "start": 40133338,
+            "end": 40152383,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/objects/jokers/sandbox/extra-credit/warlock.lua",
+            "filename": "/Mods/Omegatro/assets/2x/greg_pack.png",
             "crunched": 0,
-            "start": 46030266,
-            "end": 46032741,
+            "start": 40152383,
+            "end": 40162829,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/objects/jokers/sandbox/extra-credit/werewolf.lua",
+            "filename": "/Mods/Omegatro/assets/2x/gregdeck.png",
             "crunched": 0,
-            "start": 46032741,
-            "end": 46034079,
+            "start": 40162829,
+            "end": 40171159,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/objects/jokers/sandbox/faceless.lua",
+            "filename": "/Mods/Omegatro/assets/2x/gregorius.png",
             "crunched": 0,
-            "start": 46034079,
-            "end": 46035486,
+            "start": 40171159,
+            "end": 40172510,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/objects/jokers/sandbox/golden_ticket.lua",
+            "filename": "/Mods/Omegatro/assets/2x/h&s.png",
             "crunched": 0,
-            "start": 46035486,
-            "end": 46036846,
+            "start": 40172510,
+            "end": 40175136,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/objects/jokers/sandbox/hit_the_road.lua",
+            "filename": "/Mods/Omegatro/assets/2x/HTML_pro.png",
             "crunched": 0,
-            "start": 46036846,
-            "end": 46038016,
+            "start": 40175136,
+            "end": 40176817,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/objects/jokers/sandbox/idol.lua",
+            "filename": "/Mods/Omegatro/assets/2x/icon.png",
             "crunched": 0,
-            "start": 46038016,
-            "end": 46044423,
+            "start": 40176817,
+            "end": 40177614,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/objects/jokers/sandbox/juggler.lua",
+            "filename": "/Mods/Omegatro/assets/2x/infinity.png",
             "crunched": 0,
-            "start": 46044423,
-            "end": 46046244,
+            "start": 40177614,
+            "end": 40180093,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/objects/jokers/sandbox/loyalty_card.lua",
+            "filename": "/Mods/Omegatro/assets/2x/job.png",
             "crunched": 0,
-            "start": 46046244,
-            "end": 46048439,
+            "start": 40180093,
+            "end": 40183300,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/objects/jokers/sandbox/lucky_cat.lua",
+            "filename": "/Mods/Omegatro/assets/2x/jumbo_omega_pack.png",
             "crunched": 0,
-            "start": 46048439,
-            "end": 46049765,
+            "start": 40183300,
+            "end": 40188009,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/objects/jokers/sandbox/magnet_sandbox.lua",
+            "filename": "/Mods/Omegatro/assets/2x/jv.png",
             "crunched": 0,
-            "start": 46049765,
-            "end": 46052681,
+            "start": 40188009,
+            "end": 40200807,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/objects/jokers/sandbox/mail.lua",
+            "filename": "/Mods/Omegatro/assets/2x/keep_gambling.png",
             "crunched": 0,
-            "start": 46052681,
-            "end": 46054240,
+            "start": 40200807,
+            "end": 40243614,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/objects/jokers/sandbox/misprint.lua",
+            "filename": "/Mods/Omegatro/assets/2x/labubu_joker.png",
             "crunched": 0,
-            "start": 46054240,
-            "end": 46055394,
+            "start": 40243614,
+            "end": 40279607,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/objects/jokers/sandbox/order.lua",
+            "filename": "/Mods/Omegatro/assets/2x/le_triangle.png",
             "crunched": 0,
-            "start": 46055394,
-            "end": 46056753,
+            "start": 40279607,
+            "end": 40296920,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/objects/jokers/sandbox/photograph.lua",
+            "filename": "/Mods/Omegatro/assets/2x/local58.png",
             "crunched": 0,
-            "start": 46056753,
-            "end": 46057762,
+            "start": 40296920,
+            "end": 40309599,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/objects/jokers/sandbox/ride_the_bus.lua",
+            "filename": "/Mods/Omegatro/assets/2x/loss.png",
             "crunched": 0,
-            "start": 46057762,
-            "end": 46059643,
+            "start": 40309599,
+            "end": 40310372,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/objects/jokers/sandbox/runner.lua",
+            "filename": "/Mods/Omegatro/assets/2x/mega_omega_pack.png",
             "crunched": 0,
-            "start": 46059643,
-            "end": 46060727,
+            "start": 40310372,
+            "end": 40315597,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/objects/jokers/sandbox/satellite.lua",
+            "filename": "/Mods/Omegatro/assets/2x/minecraft.png",
             "crunched": 0,
-            "start": 46060727,
-            "end": 46062258,
+            "start": 40315597,
+            "end": 40317873,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/objects/jokers/sandbox/square.lua",
+            "filename": "/Mods/Omegatro/assets/2x/mmorpg.png",
             "crunched": 0,
-            "start": 46062258,
-            "end": 46063382,
+            "start": 40317873,
+            "end": 40319490,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/objects/jokers/sandbox/steel_joker.lua",
+            "filename": "/Mods/Omegatro/assets/2x/moche.png",
             "crunched": 0,
-            "start": 46063382,
-            "end": 46064233,
+            "start": 40319490,
+            "end": 40370503,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/objects/jokers/sandbox/throwback.lua",
+            "filename": "/Mods/Omegatro/assets/2x/ms_paint.png",
             "crunched": 0,
-            "start": 46064233,
-            "end": 46066545,
+            "start": 40370503,
+            "end": 40376346,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/objects/jokers/sandbox/vampire.lua",
+            "filename": "/Mods/Omegatro/assets/2x/multiple_choice.png",
             "crunched": 0,
-            "start": 46066545,
-            "end": 46068737,
+            "start": 40376346,
+            "end": 40377976,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/objects/jokers/skip_off.lua",
+            "filename": "/Mods/Omegatro/assets/2x/negation.png",
             "crunched": 0,
-            "start": 46068737,
-            "end": 46070608,
+            "start": 40377976,
+            "end": 40379567,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/objects/jokers/speedrun.lua",
+            "filename": "/Mods/Omegatro/assets/2x/nft.png",
             "crunched": 0,
-            "start": 46070608,
-            "end": 46072332,
+            "start": 40379567,
+            "end": 40381276,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/objects/jokers/standard/bloodstone.lua",
+            "filename": "/Mods/Omegatro/assets/2x/nuke.png",
             "crunched": 0,
-            "start": 46072332,
-            "end": 46074447,
+            "start": 40381276,
+            "end": 40388131,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/objects/jokers/standard/hanging_chad.lua",
+            "filename": "/Mods/Omegatro/assets/2x/obsidian.png",
             "crunched": 0,
-            "start": 46074447,
-            "end": 46075292,
+            "start": 40388131,
+            "end": 40395133,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/objects/jokers/standard/ice_cream.lua",
+            "filename": "/Mods/Omegatro/assets/2x/omega_deck.png",
             "crunched": 0,
-            "start": 46075292,
-            "end": 46076412,
+            "start": 40395133,
+            "end": 40397558,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/objects/jokers/standard/seltzer.lua",
+            "filename": "/Mods/Omegatro/assets/2x/omega_joker.png",
             "crunched": 0,
-            "start": 46076412,
-            "end": 46078629,
+            "start": 40397558,
+            "end": 40405065,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/objects/jokers/standard/ticket.lua",
+            "filename": "/Mods/Omegatro/assets/2x/omega_pack.png",
             "crunched": 0,
-            "start": 46078629,
-            "end": 46080516,
+            "start": 40405065,
+            "end": 40408892,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/objects/jokers/standard/turtle_bean.lua",
+            "filename": "/Mods/Omegatro/assets/2x/omega_suit.png",
             "crunched": 0,
-            "start": 46080516,
-            "end": 46081820,
+            "start": 40408892,
+            "end": 40433663,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/objects/jokers/taxes.lua",
+            "filename": "/Mods/Omegatro/assets/2x/omega_ui.png",
             "crunched": 0,
-            "start": 46081820,
-            "end": 46083410,
+            "start": 40433663,
+            "end": 40434221,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/objects/seals/mp_gold_seal.lua",
+            "filename": "/Mods/Omegatro/assets/2x/omega_voucher.png",
             "crunched": 0,
-            "start": 46083410,
-            "end": 46083709,
+            "start": 40434221,
+            "end": 40436092,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/objects/stakes/00_planet.lua",
+            "filename": "/Mods/Omegatro/assets/2x/optimally_packed.png",
             "crunched": 0,
-            "start": 46083709,
-            "end": 46084390,
+            "start": 40436092,
+            "end": 40437277,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/objects/stakes/01_spectral.lua",
+            "filename": "/Mods/Omegatro/assets/2x/os_maias.png",
             "crunched": 0,
-            "start": 46084390,
-            "end": 46084799,
+            "start": 40437277,
+            "end": 40439115,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/objects/stakes/02_spectralplus.lua",
+            "filename": "/Mods/Omegatro/assets/2x/pass.png",
             "crunched": 0,
-            "start": 46084799,
-            "end": 46085165,
+            "start": 40439115,
+            "end": 40440076,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/objects/stakes/1_plastic.lua",
+            "filename": "/Mods/Omegatro/assets/2x/pegi18.png",
             "crunched": 0,
-            "start": 46085165,
-            "end": 46087907,
+            "start": 40440076,
+            "end": 40440998,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/objects/stakes/2_pebble.lua",
+            "filename": "/Mods/Omegatro/assets/2x/petrification_device.png",
             "crunched": 0,
-            "start": 46087907,
-            "end": 46088341,
+            "start": 40440998,
+            "end": 40449628,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/objects/stakes/3_ferrite.lua",
+            "filename": "/Mods/Omegatro/assets/2x/phone.png",
             "crunched": 0,
-            "start": 46088341,
-            "end": 46088764,
+            "start": 40449628,
+            "end": 40515659,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/objects/stakes/4_pyrite.lua",
+            "filename": "/Mods/Omegatro/assets/2x/photograph_fixed.png",
             "crunched": 0,
-            "start": 46088764,
-            "end": 46089754,
+            "start": 40515659,
+            "end": 40526982,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/objects/stakes/5_jade.lua",
+            "filename": "/Mods/Omegatro/assets/2x/pi.png",
             "crunched": 0,
-            "start": 46089754,
-            "end": 46090182,
+            "start": 40526982,
+            "end": 40534967,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/objects/stakes/6_crystal.lua",
+            "filename": "/Mods/Omegatro/assets/2x/prophecy.png",
             "crunched": 0,
-            "start": 46090182,
-            "end": 46090598,
+            "start": 40534967,
+            "end": 40548045,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/objects/stakes/7_antimatter.lua",
+            "filename": "/Mods/Omegatro/assets/2x/rabbit_clock.png",
             "crunched": 0,
-            "start": 46090598,
-            "end": 46091024,
+            "start": 40548045,
+            "end": 40549804,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/objects/stakes/atlas.lua",
+            "filename": "/Mods/Omegatro/assets/2x/rainbow.png",
             "crunched": 0,
-            "start": 46091024,
-            "end": 46091205,
+            "start": 40549804,
+            "end": 40551177,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/objects/stickers/_stickers.lua",
+            "filename": "/Mods/Omegatro/assets/2x/reboot_card.png",
             "crunched": 0,
-            "start": 46091205,
-            "end": 46093864,
+            "start": 40551177,
+            "end": 40556159,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/objects/stickers/1_persistent.lua",
+            "filename": "/Mods/Omegatro/assets/2x/redacted.png",
             "crunched": 0,
-            "start": 46093864,
-            "end": 46098542,
+            "start": 40556159,
+            "end": 40557294,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/objects/stickers/2_unreliable.lua",
+            "filename": "/Mods/Omegatro/assets/2x/reinforced.png",
             "crunched": 0,
-            "start": 46098542,
-            "end": 46099024,
+            "start": 40557294,
+            "end": 40558955,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/objects/stickers/3_draining.lua",
+            "filename": "/Mods/Omegatro/assets/2x/rigged.png",
             "crunched": 0,
-            "start": 46099024,
-            "end": 46099397,
+            "start": 40558955,
+            "end": 40570214,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/objects/stickers/balanced.lua",
+            "filename": "/Mods/Omegatro/assets/2x/rixy.png",
             "crunched": 0,
-            "start": 46099397,
-            "end": 46099880,
+            "start": 40570214,
+            "end": 40584904,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/objects/stickers/extra_credit.lua",
+            "filename": "/Mods/Omegatro/assets/2x/rtl.png",
             "crunched": 0,
-            "start": 46099880,
-            "end": 46100094,
+            "start": 40584904,
+            "end": 40586421,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/objects/stickers/nemesis.lua",
+            "filename": "/Mods/Omegatro/assets/2x/scaling.png",
             "crunched": 0,
-            "start": 46100094,
-            "end": 46100367,
+            "start": 40586421,
+            "end": 40588133,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/objects/tags/gambling_sandbox.lua",
+            "filename": "/Mods/Omegatro/assets/2x/sigil_joker.png",
             "crunched": 0,
-            "start": 46100367,
-            "end": 46102169,
+            "start": 40588133,
+            "end": 40602128,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/objects/tags/investment_sandbox.lua",
+            "filename": "/Mods/Omegatro/assets/2x/sigil.png",
             "crunched": 0,
-            "start": 46102169,
-            "end": 46103273,
+            "start": 40602128,
+            "end": 40612899,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/objects/tags/juggle_sandbox.lua",
+            "filename": "/Mods/Omegatro/assets/2x/simp.png",
             "crunched": 0,
-            "start": 46103273,
-            "end": 46103909,
+            "start": 40612899,
+            "end": 40620833,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/overrides/disable_restart.lua",
+            "filename": "/Mods/Omegatro/assets/2x/slothful.png",
             "crunched": 0,
-            "start": 46103909,
-            "end": 46104079,
+            "start": 40620833,
+            "end": 40626708,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/overrides/game.lua",
+            "filename": "/Mods/Omegatro/assets/2x/squared.png",
             "crunched": 0,
-            "start": 46104079,
-            "end": 46110175,
+            "start": 40626708,
+            "end": 40635183,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/overrides/hide_content.lua",
+            "filename": "/Mods/Omegatro/assets/2x/star_sticker.png",
             "crunched": 0,
-            "start": 46110175,
-            "end": 46112397,
+            "start": 40635183,
+            "end": 40635919,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/overrides/mod_badges.lua",
+            "filename": "/Mods/Omegatro/assets/2x/swapping.png",
             "crunched": 0,
-            "start": 46112397,
-            "end": 46115333,
+            "start": 40635919,
+            "end": 40640326,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/README.md",
+            "filename": "/Mods/Omegatro/assets/2x/thatcher.png",
             "crunched": 0,
-            "start": 46115333,
-            "end": 46118678,
+            "start": 40640326,
+            "end": 40641781,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/replays/.gitkeep",
+            "filename": "/Mods/Omegatro/assets/2x/the_gathering.png",
             "crunched": 0,
-            "start": 46118678,
-            "end": 46118678,
+            "start": 40641781,
+            "end": 40643682,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/rulesets/_rulesets.lua",
+            "filename": "/Mods/Omegatro/assets/2x/the_solo.png",
             "crunched": 0,
-            "start": 46118678,
-            "end": 46130213,
+            "start": 40643682,
+            "end": 40645559,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/rulesets/badlatro.lua",
+            "filename": "/Mods/Omegatro/assets/2x/the_squad.png",
             "crunched": 0,
-            "start": 46130213,
-            "end": 46131416,
+            "start": 40645559,
+            "end": 40647456,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/rulesets/blitz.lua",
+            "filename": "/Mods/Omegatro/assets/2x/the_twins.png",
             "crunched": 0,
-            "start": 46131416,
-            "end": 46131483,
+            "start": 40647456,
+            "end": 40649355,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/rulesets/chaos.lua",
+            "filename": "/Mods/Omegatro/assets/2x/titlescreen.png",
             "crunched": 0,
-            "start": 46131483,
-            "end": 46131599,
+            "start": 40649355,
+            "end": 40651423,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/rulesets/experimental/experimental_legacy.lua",
+            "filename": "/Mods/Omegatro/assets/2x/toilet_paper.png",
             "crunched": 0,
-            "start": 46131599,
-            "end": 46132244,
+            "start": 40651423,
+            "end": 40668527,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/rulesets/experimental/experimental.lua",
+            "filename": "/Mods/Omegatro/assets/2x/tycoon.png",
             "crunched": 0,
-            "start": 46132244,
-            "end": 46132516,
+            "start": 40668527,
+            "end": 40669817,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/rulesets/legacy_ranked.lua",
+            "filename": "/Mods/Omegatro/assets/2x/unope_pack.png",
             "crunched": 0,
-            "start": 46132516,
-            "end": 46132644,
+            "start": 40669817,
+            "end": 40671915,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/rulesets/majorleague.lua",
+            "filename": "/Mods/Omegatro/assets/2x/upgrade.png",
             "crunched": 0,
-            "start": 46132644,
-            "end": 46133504,
+            "start": 40671915,
+            "end": 40673801,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/rulesets/minorleague.lua",
+            "filename": "/Mods/Omegatro/assets/2x/upgraded_deck.png",
             "crunched": 0,
-            "start": 46133504,
-            "end": 46134117,
+            "start": 40673801,
+            "end": 40676384,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/rulesets/ranked.lua",
+            "filename": "/Mods/Omegatro/assets/2x/verity_mad.png",
             "crunched": 0,
-            "start": 46134117,
-            "end": 46134261,
+            "start": 40676384,
+            "end": 40680249,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/rulesets/release.lua",
+            "filename": "/Mods/Omegatro/assets/2x/verity.png",
             "crunched": 0,
-            "start": 46134261,
-            "end": 46156042,
+            "start": 40680249,
+            "end": 40684108,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/rulesets/sandbox.lua",
+            "filename": "/Mods/Omegatro/assets/2x/waffle.png",
             "crunched": 0,
-            "start": 46156042,
-            "end": 46156315,
+            "start": 40684108,
+            "end": 40727466,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/rulesets/smallworld.lua",
+            "filename": "/Mods/Omegatro/assets/2x/webdriver.png",
             "crunched": 0,
-            "start": 46156315,
-            "end": 46156401,
+            "start": 40727466,
+            "end": 40728251,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/rulesets/speedlatro.lua",
+            "filename": "/Mods/Omegatro/assets/2x/wild.png",
             "crunched": 0,
-            "start": 46156401,
-            "end": 46156537,
+            "start": 40728251,
+            "end": 40737890,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/rulesets/traditional.lua",
+            "filename": "/Mods/Omegatro/assets/2x/wind.png",
             "crunched": 0,
-            "start": 46156537,
-            "end": 46156769,
+            "start": 40737890,
+            "end": 40763735,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/rulesets/vanilla.lua",
+            "filename": "/Mods/Omegatro/assets/2x/windtrackball.png",
             "crunched": 0,
-            "start": 46156769,
-            "end": 46157128,
+            "start": 40763735,
+            "end": 40764898,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/rulesets/wsob.lua",
+            "filename": "/Mods/Omegatro/assets/2x/wordle.png",
             "crunched": 0,
-            "start": 46157128,
-            "end": 46157900,
+            "start": 40764898,
+            "end": 40766290,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/scripts/release.sh",
+            "filename": "/Mods/Omegatro/assets/fonts/Birthlong.ttf",
             "crunched": 0,
-            "start": 46157900,
-            "end": 46163773,
+            "start": 40766290,
+            "end": 40800578,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/stylua.toml",
+            "filename": "/Mods/Omegatro/assets/fonts/Comic Sans.ttf",
             "crunched": 0,
-            "start": 46163773,
-            "end": 46164126,
+            "start": 40800578,
+            "end": 41046178,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/tests/readme.md",
+            "filename": "/Mods/Omegatro/assets/fonts/LuckiestGuy.ttf",
             "crunched": 0,
-            "start": 46164126,
-            "end": 46167348,
+            "start": 41046178,
+            "end": 41104502,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/tests/ruleset_shape.snapshot.lua",
+            "filename": "/Mods/Omegatro/assets/fonts/PUSAB.ttf",
             "crunched": 0,
-            "start": 46167348,
-            "end": 46185140,
+            "start": 41104502,
+            "end": 41161498,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/tests/test_rlog_checksum.lua",
+            "filename": "/Mods/Omegatro/assets/fonts/Renogare.ttf",
             "crunched": 0,
-            "start": 46185140,
-            "end": 46187452,
+            "start": 41161498,
+            "end": 41301570,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/tests/test_rlog_roundtrip.lua",
+            "filename": "/Mods/Omegatro/assets/fonts/Satisfontory.ttf",
             "crunched": 0,
-            "start": 46187452,
-            "end": 46192762,
+            "start": 41301570,
+            "end": 41307758,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/tests/test_rlog_stream.lua",
+            "filename": "/Mods/Omegatro/assets/fonts/Symbola.ttf",
             "crunched": 0,
-            "start": 46192762,
-            "end": 46196187,
+            "start": 41307758,
+            "end": 43547858,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/tests/test_ruleset_shape.lua",
+            "filename": "/Mods/Omegatro/assets/fonts/times.ttf",
             "crunched": 0,
-            "start": 46196187,
-            "end": 46207184,
+            "start": 43547858,
+            "end": 43895846,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/tests/test_serialization_guard.lua",
+            "filename": "/Mods/Omegatro/assets/fonts/Wingdings.ttf",
             "crunched": 0,
-            "start": 46207184,
-            "end": 46210157,
+            "start": 43895846,
+            "end": 43963938,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/ui/_common/background_grouping.lua",
+            "filename": "/Mods/Omegatro/assets/sounds/d100.ogg",
             "crunched": 0,
-            "start": 46210157,
-            "end": 46210732,
+            "start": 43963938,
+            "end": 43979596,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/ui/_common/disableable_button.lua",
+            "filename": "/Mods/Omegatro/assets/sounds/holdup.ogg",
             "crunched": 0,
-            "start": 46210732,
-            "end": 46211609,
+            "start": 43979596,
+            "end": 44009028,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/ui/_common/disableable_option_cycle.lua",
+            "filename": "/Mods/Omegatro/assets/sounds/music_labubu.ogg",
             "crunched": 0,
-            "start": 46211609,
-            "end": 46211952,
+            "start": 44009028,
+            "end": 45125519,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/ui/_common/disableable_toggle.lua",
+            "filename": "/Mods/Omegatro/assets/sounds/ok.ogg",
             "crunched": 0,
-            "start": 46211952,
-            "end": 46212614,
+            "start": 45125519,
+            "end": 45146538,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/ui/_common/spacer.lua",
+            "filename": "/Mods/Omegatro/crashes.txt",
             "crunched": 0,
-            "start": 46212614,
-            "end": 46212887,
+            "start": 45146538,
+            "end": 45146541,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/ui/game/blind_chip_sprite.lua",
+            "filename": "/Mods/Omegatro/items/boosters.lua",
             "crunched": 0,
-            "start": 46212887,
-            "end": 46213555,
+            "start": 45146541,
+            "end": 45152654,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/ui/game/blind_choice.lua",
+            "filename": "/Mods/Omegatro/items/consumables.lua",
             "crunched": 0,
-            "start": 46213555,
-            "end": 46227963,
+            "start": 45152654,
+            "end": 45169592,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/ui/game/blind_hud.lua",
+            "filename": "/Mods/Omegatro/items/decks.lua",
             "crunched": 0,
-            "start": 46227963,
-            "end": 46238454,
+            "start": 45169592,
+            "end": 45171762,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/ui/game/confirmation.lua",
+            "filename": "/Mods/Omegatro/items/enchancers.lua",
             "crunched": 0,
-            "start": 46238454,
-            "end": 46239374,
+            "start": 45171762,
+            "end": 45182867,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/ui/game/enemy_location.lua",
+            "filename": "/Mods/Omegatro/items/jokers.lua",
             "crunched": 0,
-            "start": 46239374,
-            "end": 46246165,
+            "start": 45182867,
+            "end": 45291198,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/ui/game/functions.lua",
+            "filename": "/Mods/Omegatro/items/menu.lua",
             "crunched": 0,
-            "start": 46246165,
-            "end": 46260928,
+            "start": 45291198,
+            "end": 45293814,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/ui/game/game_end.lua",
+            "filename": "/Mods/Omegatro/items/suit_and_rarity.lua",
             "crunched": 0,
-            "start": 46260928,
-            "end": 46278824,
+            "start": 45293814,
+            "end": 45294745,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/ui/game/game_state.lua",
+            "filename": "/Mods/Omegatro/items/vouchers.lua",
             "crunched": 0,
-            "start": 46278824,
-            "end": 46298596,
+            "start": 45294745,
+            "end": 45295834,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/ui/game/lobby_info.lua",
+            "filename": "/Mods/Omegatro/main.lua",
             "crunched": 0,
-            "start": 46298596,
-            "end": 46306421,
+            "start": 45295834,
+            "end": 45301148,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/ui/game/round.lua",
+            "filename": "/Mods/Omegatro/mod.json",
             "crunched": 0,
-            "start": 46306421,
-            "end": 46309510,
+            "start": 45301148,
+            "end": 45301567,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/ui/game/ruleset_info_menu.lua",
+            "filename": "/Mods/Omegatro/rtl_posts.txt",
             "crunched": 0,
-            "start": 46309510,
-            "end": 46313708,
+            "start": 45301567,
+            "end": 45301571,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/ui/game/timer.lua",
+            "filename": "/Mods/Omegatro/sounds/gold_click.ogg",
             "crunched": 0,
-            "start": 46313708,
-            "end": 46333641,
+            "start": 45301571,
+            "end": 45313408,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/ui/lobby/_lobby_options/advanced_tab.lua",
+            "filename": "/Mods/Omegatro/sounds/ok.ogg",
             "crunched": 0,
-            "start": 46333641,
-            "end": 46338293,
+            "start": 45313408,
+            "end": 45334427,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/ui/lobby/_lobby_options/gameplay_tab.lua",
+            "filename": "/Mods/POLTERWORX/assets/1x/default/b_jen_decks.png",
             "crunched": 0,
-            "start": 46338293,
-            "end": 46338933,
+            "start": 45334427,
+            "end": 45443793,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/ui/lobby/_lobby_options/main_options.lua",
+            "filename": "/Mods/POLTERWORX/assets/1x/default/bl_jen_blinds.png",
             "crunched": 0,
-            "start": 46338933,
-            "end": 46342789,
+            "start": 45443793,
+            "end": 45460579,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/ui/lobby/_lobby_options/modifiers_tab.lua",
+            "filename": "/Mods/POLTERWORX/assets/1x/default/bl_jen_epic_blinds.png",
             "crunched": 0,
-            "start": 46342789,
-            "end": 46345860,
+            "start": 45460579,
+            "end": 46076255,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/ui/lobby/_lobby_options/options_tab.lua",
+            "filename": "/Mods/POLTERWORX/assets/1x/default/bl_jen_legendary_crimson_heart.png",
             "crunched": 0,
-            "start": 46345860,
-            "end": 46348473,
+            "start": 46076255,
+            "end": 46675480,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/ui/lobby/deck_stake_button.lua",
+            "filename": "/Mods/POLTERWORX/assets/1x/default/c_jen_acc.png",
             "crunched": 0,
-            "start": 46348473,
-            "end": 46349640,
+            "start": 46675480,
+            "end": 46742748,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/ui/lobby/leave_button.lua",
+            "filename": "/Mods/POLTERWORX/assets/1x/default/c_jen_artificer.png",
             "crunched": 0,
-            "start": 46349640,
-            "end": 46349943,
+            "start": 46742748,
+            "end": 46748444,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/ui/lobby/lobby_code_buttons.lua",
+            "filename": "/Mods/POLTERWORX/assets/1x/default/c_jen_blanks.png",
             "crunched": 0,
-            "start": 46349943,
-            "end": 46350536,
+            "start": 46748444,
+            "end": 46749972,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/ui/lobby/lobby.lua",
+            "filename": "/Mods/POLTERWORX/assets/1x/default/c_jen_bottles.png",
             "crunched": 0,
-            "start": 46350536,
-            "end": 46367374,
+            "start": 46749972,
+            "end": 46752641,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/ui/lobby/players_display.lua",
+            "filename": "/Mods/POLTERWORX/assets/1x/default/c_jen_consumables1.png",
             "crunched": 0,
-            "start": 46367374,
-            "end": 46368654,
+            "start": 46752641,
+            "end": 46772852,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/ui/lobby/start_ready_button.lua",
+            "filename": "/Mods/POLTERWORX/assets/1x/default/c_jen_consumables2.png",
             "crunched": 0,
-            "start": 46368654,
-            "end": 46373080,
+            "start": 46772852,
+            "end": 46793063,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/ui/lobby/version_mismatch_warning.lua",
+            "filename": "/Mods/POLTERWORX/assets/1x/default/c_jen_consumables3.png",
             "crunched": 0,
-            "start": 46373080,
-            "end": 46376650,
+            "start": 46793063,
+            "end": 46813274,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/ui/main_menu/dev_warning.lua",
+            "filename": "/Mods/POLTERWORX/assets/1x/default/c_jen_fuse.png",
             "crunched": 0,
-            "start": 46376650,
-            "end": 46378890,
+            "start": 46813274,
+            "end": 46821291,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/ui/main_menu/main_menu.lua",
+            "filename": "/Mods/POLTERWORX/assets/1x/default/c_jen_goob.png",
             "crunched": 0,
-            "start": 46378890,
-            "end": 46381575,
+            "start": 46821291,
+            "end": 46825091,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/ui/main_menu/play_button/_modifiers_overlay.lua",
+            "filename": "/Mods/POLTERWORX/assets/1x/default/c_jen_greyhole.png",
             "crunched": 0,
-            "start": 46381575,
-            "end": 46383775,
+            "start": 46825091,
+            "end": 46825773,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/ui/main_menu/play_button/_mutators_wall.lua",
+            "filename": "/Mods/POLTERWORX/assets/1x/default/c_jen_hoxxes.png",
             "crunched": 0,
-            "start": 46383775,
-            "end": 46398933,
+            "start": 46825773,
+            "end": 46826767,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/ui/main_menu/play_button/_practice_options_overlay.lua",
+            "filename": "/Mods/POLTERWORX/assets/1x/default/c_jen_huge.png",
             "crunched": 0,
-            "start": 46398933,
-            "end": 46401143,
+            "start": 46826767,
+            "end": 46828204,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/ui/main_menu/play_button/custom_ruleset_editor.lua",
+            "filename": "/Mods/POLTERWORX/assets/1x/default/c_jen_nyx.png",
             "crunched": 0,
-            "start": 46401143,
-            "end": 46410482,
+            "start": 46828204,
+            "end": 46840021,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/ui/main_menu/play_button/gamemode_selection.lua",
+            "filename": "/Mods/POLTERWORX/assets/1x/default/c_jen_omegaplanets.png",
             "crunched": 0,
-            "start": 46410482,
-            "end": 46415301,
+            "start": 46840021,
+            "end": 47041760,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/ui/main_menu/play_button/ghost_replay_picker.lua",
+            "filename": "/Mods/POLTERWORX/assets/1x/default/c_jen_omegaspectrals.png",
             "crunched": 0,
-            "start": 46415301,
-            "end": 46434827,
+            "start": 47041760,
+            "end": 47168219,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/ui/main_menu/play_button/join_lobby_button.lua",
+            "filename": "/Mods/POLTERWORX/assets/1x/default/c_jen_omegatarots.png",
             "crunched": 0,
-            "start": 46434827,
-            "end": 46435665,
+            "start": 47168219,
+            "end": 47397358,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/ui/main_menu/play_button/play_button_callbacks.lua",
+            "filename": "/Mods/POLTERWORX/assets/1x/default/c_jen_planets.png",
             "crunched": 0,
-            "start": 46435665,
-            "end": 46439941,
+            "start": 47397358,
+            "end": 47499918,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/ui/main_menu/play_button/play_button.lua",
+            "filename": "/Mods/POLTERWORX/assets/1x/default/c_jen_reversetarots.png",
             "crunched": 0,
-            "start": 46439941,
-            "end": 46441876,
+            "start": 47499918,
+            "end": 47557749,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/ui/main_menu/play_button/ruleset_selection.lua",
+            "filename": "/Mods/POLTERWORX/assets/1x/default/c_jen_swabbie.png",
             "crunched": 0,
-            "start": 46441876,
-            "end": 46462350,
+            "start": 47557749,
+            "end": 47567315,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/ui/main_menu/play_button/weekly_interrupt.lua",
+            "filename": "/Mods/POLTERWORX/assets/1x/default/c_jen_tokens.png",
             "crunched": 0,
-            "start": 46462350,
-            "end": 46463322,
+            "start": 47567315,
+            "end": 47643814,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/ui/main_menu/title_card.lua",
+            "filename": "/Mods/POLTERWORX/assets/1x/default/c_jen_uno.png",
             "crunched": 0,
-            "start": 46463322,
-            "end": 46467311,
+            "start": 47643814,
+            "end": 47683671,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/ui/main_menu/version_display.lua",
+            "filename": "/Mods/POLTERWORX/assets/1x/default/c_jen_yawetag.png",
             "crunched": 0,
-            "start": 46467311,
-            "end": 46467865,
+            "start": 47683671,
+            "end": 47686649,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/ui/shortcuts_menu.lua",
+            "filename": "/Mods/POLTERWORX/assets/1x/default/enemy_jen_goob.png",
             "crunched": 0,
-            "start": 46467865,
-            "end": 46473468,
+            "start": 47686649,
+            "end": 47694058,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/ui/smods_menu/config_tab.lua",
+            "filename": "/Mods/POLTERWORX/assets/1x/default/iamjustsittinghere.png",
             "crunched": 0,
-            "start": 46473468,
-            "end": 46477044,
+            "start": 47694058,
+            "end": 47715022,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/ui/smods_menu/credits_tab.lua",
+            "filename": "/Mods/POLTERWORX/assets/1x/default/j_jen_7granddad.png",
             "crunched": 0,
-            "start": 46477044,
-            "end": 46478515,
+            "start": 47715022,
+            "end": 47717153,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/ui/smods_menu/customization_tab.lua",
+            "filename": "/Mods/POLTERWORX/assets/1x/default/j_jen_alice.png",
             "crunched": 0,
-            "start": 46478515,
-            "end": 46483209,
+            "start": 47717153,
+            "end": 47726230,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/ui/smods_menu/smods_menu.lua",
+            "filename": "/Mods/POLTERWORX/assets/1x/default/j_jen_amalgam.png",
             "crunched": 0,
-            "start": 46483209,
-            "end": 46484650,
+            "start": 47726230,
+            "end": 47727160,
             "audio": false
         },
         {
-            "filename": "/Mods/multiplayer/ui/utils.lua",
+            "filename": "/Mods/POLTERWORX/assets/1x/default/j_jen_artificer.png",
             "crunched": 0,
-            "start": 46484650,
-            "end": 46488004,
+            "start": 47727160,
+            "end": 47730460,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/1x/👀.png",
+            "filename": "/Mods/POLTERWORX/assets/1x/default/j_jen_astro.png",
             "crunched": 0,
-            "start": 46488004,
-            "end": 46489089,
+            "start": 47730460,
+            "end": 47738540,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/1x/all_in.png",
+            "filename": "/Mods/POLTERWORX/assets/1x/default/j_jen_aym.png",
             "crunched": 0,
-            "start": 46489089,
-            "end": 46500898,
+            "start": 47738540,
+            "end": 47743530,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/1x/alphonse.png",
+            "filename": "/Mods/POLTERWORX/assets/1x/default/j_jen_baal.png",
             "crunched": 0,
-            "start": 46500898,
-            "end": 46512931,
+            "start": 47743530,
+            "end": 47748908,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/1x/arrowace.png",
+            "filename": "/Mods/POLTERWORX/assets/1x/default/j_jen_bhdoohickey.png",
             "crunched": 0,
-            "start": 46512931,
-            "end": 46513847,
+            "start": 47748908,
+            "end": 47749838,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/1x/backpack.png",
+            "filename": "/Mods/POLTERWORX/assets/1x/default/j_jen_blighter.png",
             "crunched": 0,
-            "start": 46513847,
-            "end": 46515833,
+            "start": 47749838,
+            "end": 47759245,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/1x/bad_apple.png",
+            "filename": "/Mods/POLTERWORX/assets/1x/default/j_jen_boosterdoohickey.png",
             "crunched": 0,
-            "start": 46515833,
-            "end": 46516837,
+            "start": 47759245,
+            "end": 47760529,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/1x/bea.png",
+            "filename": "/Mods/POLTERWORX/assets/1x/default/j_jen_boxten.png",
             "crunched": 0,
-            "start": 46516837,
-            "end": 46528353,
+            "start": 47760529,
+            "end": 47762919,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/1x/bluegem.png",
+            "filename": "/Mods/POLTERWORX/assets/1x/default/j_jen_bulwark.png",
             "crunched": 0,
-            "start": 46528353,
-            "end": 46532001,
+            "start": 47762919,
+            "end": 47778921,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/1x/bro_has_the_key.png",
+            "filename": "/Mods/POLTERWORX/assets/1x/default/j_jen_charred.png",
             "crunched": 0,
-            "start": 46532001,
-            "end": 46533146,
+            "start": 47778921,
+            "end": 47799815,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/1x/caixinha.png",
+            "filename": "/Mods/POLTERWORX/assets/1x/default/j_jen_cheese.png",
             "crunched": 0,
-            "start": 46533146,
-            "end": 46538617,
+            "start": 47799815,
+            "end": 47803473,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/1x/calculator.png",
+            "filename": "/Mods/POLTERWORX/assets/1x/default/j_jen_chemach.png",
             "crunched": 0,
-            "start": 46538617,
-            "end": 46541887,
+            "start": 47803473,
+            "end": 47804757,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/1x/calculator2.png",
+            "filename": "/Mods/POLTERWORX/assets/1x/default/j_jen_chester.png",
             "crunched": 0,
-            "start": 46541887,
-            "end": 46542956,
+            "start": 47804757,
+            "end": 47813476,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/1x/chatgpt.png",
+            "filename": "/Mods/POLTERWORX/assets/1x/default/j_jen_cilantro.png",
             "crunched": 0,
-            "start": 46542956,
-            "end": 46550128,
+            "start": 47813476,
+            "end": 47828022,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/1x/cinder_block.png",
+            "filename": "/Mods/POLTERWORX/assets/1x/default/j_jen_clauneck.png",
             "crunched": 0,
-            "start": 46550128,
-            "end": 46551324,
+            "start": 47828022,
+            "end": 47829306,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/1x/coloring_book.png",
+            "filename": "/Mods/POLTERWORX/assets/1x/default/j_jen_codedoohickey.png",
             "crunched": 0,
-            "start": 46551324,
-            "end": 46556648,
+            "start": 47829306,
+            "end": 47830837,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/1x/concrete.png",
+            "filename": "/Mods/POLTERWORX/assets/1x/default/j_jen_connie.png",
             "crunched": 0,
-            "start": 46556648,
-            "end": 46558421,
+            "start": 47830837,
+            "end": 47839761,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/1x/crafting_table.png",
+            "filename": "/Mods/POLTERWORX/assets/1x/default/j_jen_consumeabledoohickey.png",
             "crunched": 0,
-            "start": 46558421,
-            "end": 46560768,
+            "start": 47839761,
+            "end": 47841045,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/1x/crafting_voucher.png",
+            "filename": "/Mods/POLTERWORX/assets/1x/default/j_jen_cosmo.png",
             "crunched": 0,
-            "start": 46560768,
-            "end": 46561632,
+            "start": 47841045,
+            "end": 47850390,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/1x/creditcard_inbuffonpack.png",
+            "filename": "/Mods/POLTERWORX/assets/1x/default/j_jen_cracked.png",
             "crunched": 0,
-            "start": 46561632,
-            "end": 46564233,
+            "start": 47850390,
+            "end": 47867857,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/1x/cryptid_reference.png",
+            "filename": "/Mods/POLTERWORX/assets/1x/default/j_jen_crimbo.png",
             "crunched": 0,
-            "start": 46564233,
-            "end": 46567317,
+            "start": 47867857,
+            "end": 47875881,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/1x/d100.png",
+            "filename": "/Mods/POLTERWORX/assets/1x/default/j_jen_crystal.png",
             "crunched": 0,
-            "start": 46567317,
-            "end": 46576449,
+            "start": 47875881,
+            "end": 47888060,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/1x/diamond_tester.png",
+            "filename": "/Mods/POLTERWORX/assets/1x/default/j_jen_dandy.png",
             "crunched": 0,
-            "start": 46576449,
-            "end": 46577273,
+            "start": 47888060,
+            "end": 47907335,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/1x/diamond.png",
+            "filename": "/Mods/POLTERWORX/assets/1x/default/j_jen_datura.png",
             "crunched": 0,
-            "start": 46577273,
-            "end": 46579928,
+            "start": 47907335,
+            "end": 47921004,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/1x/disco.png",
+            "filename": "/Mods/POLTERWORX/assets/1x/default/j_jen_drago.png",
             "crunched": 0,
-            "start": 46579928,
-            "end": 46589342,
+            "start": 47921004,
+            "end": 47927049,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/1x/dubai_chocolate.png",
+            "filename": "/Mods/POLTERWORX/assets/1x/default/j_jen_dragofiend.png",
             "crunched": 0,
-            "start": 46589342,
-            "end": 46590640,
+            "start": 47927049,
+            "end": 47933557,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/1x/embed_fail_card.png",
+            "filename": "/Mods/POLTERWORX/assets/1x/default/j_jen_escapey.png",
             "crunched": 0,
-            "start": 46590640,
-            "end": 46591233,
+            "start": 47933557,
+            "end": 47935854,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/1x/embed_fail.png",
+            "filename": "/Mods/POLTERWORX/assets/1x/default/j_jen_faceless.png",
             "crunched": 0,
-            "start": 46591233,
-            "end": 46592069,
+            "start": 47935854,
+            "end": 47944403,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/1x/epic_games.png",
+            "filename": "/Mods/POLTERWORX/assets/1x/default/j_jen_finn.png",
             "crunched": 0,
-            "start": 46592069,
-            "end": 46592804,
+            "start": 47944403,
+            "end": 47948131,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/1x/error.png",
+            "filename": "/Mods/POLTERWORX/assets/1x/default/j_jen_foundry.png",
             "crunched": 0,
-            "start": 46592804,
-            "end": 46594228,
+            "start": 47948131,
+            "end": 47959897,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/1x/fake_png.png",
+            "filename": "/Mods/POLTERWORX/assets/1x/default/j_jen_gamingchair.png",
             "crunched": 0,
-            "start": 46594228,
-            "end": 46595492,
+            "start": 47959897,
+            "end": 47969568,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/1x/formula.png",
+            "filename": "/Mods/POLTERWORX/assets/1x/default/j_jen_glisten.png",
             "crunched": 0,
-            "start": 46595492,
-            "end": 46596662,
+            "start": 47969568,
+            "end": 47978053,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/1x/fortnite.png",
+            "filename": "/Mods/POLTERWORX/assets/1x/default/j_jen_godsmarble.png",
             "crunched": 0,
-            "start": 46596662,
-            "end": 46603170,
+            "start": 47978053,
+            "end": 48006001,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/1x/foto.png",
+            "filename": "/Mods/POLTERWORX/assets/1x/default/j_jen_goob_lefthand.png",
             "crunched": 0,
-            "start": 46603170,
-            "end": 46604383,
+            "start": 48006001,
+            "end": 48008111,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/1x/foto2.png",
+            "filename": "/Mods/POLTERWORX/assets/1x/default/j_jen_goob_righthand.png",
             "crunched": 0,
-            "start": 46604383,
-            "end": 46616838,
+            "start": 48008111,
+            "end": 48010207,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/1x/free_wifi.png",
+            "filename": "/Mods/POLTERWORX/assets/1x/default/j_jen_goob.png",
             "crunched": 0,
-            "start": 46616838,
-            "end": 46617751,
+            "start": 48010207,
+            "end": 48014658,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/1x/frutiger_aero.png",
+            "filename": "/Mods/POLTERWORX/assets/1x/default/j_jen_gourmand.png",
             "crunched": 0,
-            "start": 46617751,
-            "end": 46632362,
+            "start": 48014658,
+            "end": 48016766,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/1x/fuckass_dog.png",
+            "filename": "/Mods/POLTERWORX/assets/1x/default/j_jen_haro.png",
             "crunched": 0,
-            "start": 46632362,
-            "end": 46648929,
+            "start": 48016766,
+            "end": 48018050,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/1x/gambling.png",
+            "filename": "/Mods/POLTERWORX/assets/1x/default/j_jen_heket.png",
             "crunched": 0,
-            "start": 46648929,
-            "end": 46651057,
+            "start": 48018050,
+            "end": 48037431,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/1x/gaster.png",
+            "filename": "/Mods/POLTERWORX/assets/1x/default/j_jen_honey.png",
             "crunched": 0,
-            "start": 46651057,
-            "end": 46657336,
+            "start": 48037431,
+            "end": 48042076,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/1x/golden_cookie.png",
+            "filename": "/Mods/POLTERWORX/assets/1x/default/j_jen_hunter.png",
             "crunched": 0,
-            "start": 46657336,
-            "end": 46670413,
+            "start": 48042076,
+            "end": 48053077,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/1x/goodbelisk.png",
+            "filename": "/Mods/POLTERWORX/assets/1x/default/j_jen_indusblue.png",
             "crunched": 0,
-            "start": 46670413,
-            "end": 46676495,
+            "start": 48053077,
+            "end": 48067222,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/1x/gravestone.png",
+            "filename": "/Mods/POLTERWORX/assets/1x/default/j_jen_inhabited.png",
             "crunched": 0,
-            "start": 46676495,
-            "end": 46687226,
+            "start": 48067222,
+            "end": 48091724,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/1x/greg_materials.png",
+            "filename": "/Mods/POLTERWORX/assets/1x/default/j_jen_jeremy.png",
             "crunched": 0,
-            "start": 46687226,
-            "end": 46699438,
+            "start": 48091724,
+            "end": 48095457,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/1x/greg_pack.png",
+            "filename": "/Mods/POLTERWORX/assets/1x/default/j_jen_jimbo.png",
             "crunched": 0,
-            "start": 46699438,
-            "end": 46706930,
+            "start": 48095457,
+            "end": 48102539,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/1x/gregdeck.png",
+            "filename": "/Mods/POLTERWORX/assets/1x/default/j_jen_kaleido.png",
             "crunched": 0,
-            "start": 46706930,
-            "end": 46712734,
+            "start": 48102539,
+            "end": 48105426,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/1x/gregorius.png",
+            "filename": "/Mods/POLTERWORX/assets/1x/default/j_jen_kallamar.png",
             "crunched": 0,
-            "start": 46712734,
-            "end": 46713795,
+            "start": 48105426,
+            "end": 48106710,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/1x/h&s.png",
+            "filename": "/Mods/POLTERWORX/assets/1x/default/j_jen_kori.png",
             "crunched": 0,
-            "start": 46713795,
-            "end": 46715603,
+            "start": 48106710,
+            "end": 48122138,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/1x/HTML_pro.png",
+            "filename": "/Mods/POLTERWORX/assets/1x/default/j_jen_kosmos.png",
             "crunched": 0,
-            "start": 46715603,
-            "end": 46716821,
+            "start": 48122138,
+            "end": 48135250,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/1x/icon.png",
+            "filename": "/Mods/POLTERWORX/assets/1x/default/j_jen_kudaai.png",
             "crunched": 0,
-            "start": 46716821,
-            "end": 46717553,
+            "start": 48135250,
+            "end": 48136180,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/1x/infinity.png",
+            "filename": "/Mods/POLTERWORX/assets/1x/default/j_jen_lamb.png",
             "crunched": 0,
-            "start": 46717553,
-            "end": 46719583,
+            "start": 48136180,
+            "end": 48137464,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/1x/job.png",
+            "filename": "/Mods/POLTERWORX/assets/1x/default/j_jen_landa.png",
             "crunched": 0,
-            "start": 46719583,
-            "end": 46722147,
+            "start": 48137464,
+            "end": 48152582,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/1x/jumbo_omega_pack.png",
+            "filename": "/Mods/POLTERWORX/assets/1x/default/j_jen_leshy.png",
             "crunched": 0,
-            "start": 46722147,
-            "end": 46725598,
+            "start": 48152582,
+            "end": 48156894,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/1x/jv.png",
+            "filename": "/Mods/POLTERWORX/assets/1x/default/j_jen_lugia.png",
             "crunched": 0,
-            "start": 46725598,
-            "end": 46735007,
+            "start": 48156894,
+            "end": 48163498,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/1x/keep_gambling.png",
+            "filename": "/Mods/POLTERWORX/assets/1x/default/j_jen_luke.png",
             "crunched": 0,
-            "start": 46735007,
-            "end": 46747914,
+            "start": 48163498,
+            "end": 48164782,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/1x/labubu_joker.png",
+            "filename": "/Mods/POLTERWORX/assets/1x/default/j_jen_math.png",
             "crunched": 0,
-            "start": 46747914,
-            "end": 46758841,
+            "start": 48164782,
+            "end": 48170350,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/1x/le_triangle.png",
+            "filename": "/Mods/POLTERWORX/assets/1x/default/j_jen_maxie.png",
             "crunched": 0,
-            "start": 46758841,
-            "end": 46771001,
+            "start": 48170350,
+            "end": 48174722,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/1x/local58.png",
+            "filename": "/Mods/POLTERWORX/assets/1x/default/j_jen_monk.png",
             "crunched": 0,
-            "start": 46771001,
-            "end": 46780110,
+            "start": 48174722,
+            "end": 48176837,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/1x/loss.png",
+            "filename": "/Mods/POLTERWORX/assets/1x/default/j_jen_multi.png",
             "crunched": 0,
-            "start": 46780110,
-            "end": 46780705,
+            "start": 48176837,
+            "end": 48183779,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/1x/mega_omega_pack.png",
+            "filename": "/Mods/POLTERWORX/assets/1x/default/j_jen_narinder.png",
             "crunched": 0,
-            "start": 46780705,
-            "end": 46784448,
+            "start": 48183779,
+            "end": 48185063,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/1x/minecraft.png",
+            "filename": "/Mods/POLTERWORX/assets/1x/default/j_jen_negativedoohickey.png",
             "crunched": 0,
-            "start": 46784448,
-            "end": 46786138,
+            "start": 48185063,
+            "end": 48186347,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/1x/mmorpg.png",
+            "filename": "/Mods/POLTERWORX/assets/1x/default/j_jen_nexus.png",
             "crunched": 0,
-            "start": 46786138,
-            "end": 46787348,
+            "start": 48186347,
+            "end": 48203407,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/1x/moche.png",
+            "filename": "/Mods/POLTERWORX/assets/1x/default/j_jen_noise.png",
             "crunched": 0,
-            "start": 46787348,
-            "end": 46801814,
+            "start": 48203407,
+            "end": 48207381,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/1x/ms_paint.png",
+            "filename": "/Mods/POLTERWORX/assets/1x/default/j_jen_nubby.png",
             "crunched": 0,
-            "start": 46801814,
-            "end": 46806383,
+            "start": 48207381,
+            "end": 48210607,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/1x/multiple_choice.png",
+            "filename": "/Mods/POLTERWORX/assets/1x/default/j_jen_nyx.png",
             "crunched": 0,
-            "start": 46806383,
-            "end": 46807619,
+            "start": 48210607,
+            "end": 48222421,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/1x/negation.png",
+            "filename": "/Mods/POLTERWORX/assets/1x/default/j_jen_omegadoohickey.png",
             "crunched": 0,
-            "start": 46807619,
-            "end": 46808856,
+            "start": 48222421,
+            "end": 48223705,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/1x/netherite.png",
+            "filename": "/Mods/POLTERWORX/assets/1x/default/j_jen_onewhowaits.png",
             "crunched": 0,
-            "start": 46808856,
-            "end": 46809772,
+            "start": 48223705,
+            "end": 48224989,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/1x/nft.png",
+            "filename": "/Mods/POLTERWORX/assets/1x/default/j_jen_oxy.png",
             "crunched": 0,
-            "start": 46809772,
-            "end": 46811160,
+            "start": 48224989,
+            "end": 48238547,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/1x/nuke.png",
+            "filename": "/Mods/POLTERWORX/assets/1x/default/j_jen_p03.png",
             "crunched": 0,
-            "start": 46811160,
-            "end": 46816197,
+            "start": 48238547,
+            "end": 48239831,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/1x/obsidian.png",
+            "filename": "/Mods/POLTERWORX/assets/1x/default/j_jen_paragon.png",
             "crunched": 0,
-            "start": 46816197,
-            "end": 46824040,
+            "start": 48239831,
+            "end": 48258688,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/1x/omega_deck.png",
+            "filename": "/Mods/POLTERWORX/assets/1x/default/j_jen_peppino.png",
             "crunched": 0,
-            "start": 46824040,
-            "end": 46826153,
+            "start": 48258688,
+            "end": 48261866,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/1x/omega_joker.png",
+            "filename": "/Mods/POLTERWORX/assets/1x/default/j_jen_pickel.png",
             "crunched": 0,
-            "start": 46826153,
-            "end": 46831962,
+            "start": 48261866,
+            "end": 48265629,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/1x/omega_pack.png",
+            "filename": "/Mods/POLTERWORX/assets/1x/default/j_jen_pixel.png",
             "crunched": 0,
-            "start": 46831962,
-            "end": 46834972,
+            "start": 48265629,
+            "end": 48270501,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/1x/omega_suit.png",
+            "filename": "/Mods/POLTERWORX/assets/1x/default/j_jen_planetleveldoohickey.png",
             "crunched": 0,
-            "start": 46834972,
-            "end": 46853222,
+            "start": 48270501,
+            "end": 48271785,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/1x/omega_ui.png",
+            "filename": "/Mods/POLTERWORX/assets/1x/default/j_jen_pldoohickey.png",
             "crunched": 0,
-            "start": 46853222,
-            "end": 46853741,
+            "start": 48271785,
+            "end": 48272715,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/1x/omega_voucher.png",
+            "filename": "/Mods/POLTERWORX/assets/1x/default/j_jen_queen.png",
             "crunched": 0,
-            "start": 46853741,
-            "end": 46855200,
+            "start": 48272715,
+            "end": 48289596,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/1x/optimally_packed.png",
+            "filename": "/Mods/POLTERWORX/assets/1x/default/j_jen_ratau.png",
             "crunched": 0,
-            "start": 46855200,
-            "end": 46856141,
+            "start": 48289596,
+            "end": 48290880,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/1x/os_maias.png",
+            "filename": "/Mods/POLTERWORX/assets/1x/default/j_jen_razzledazzle.png",
             "crunched": 0,
-            "start": 46856141,
-            "end": 46857605,
+            "start": 48290880,
+            "end": 48296807,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/1x/pass.png",
+            "filename": "/Mods/POLTERWORX/assets/1x/default/j_jen_rivulet.png",
             "crunched": 0,
-            "start": 46857605,
-            "end": 46858372,
+            "start": 48296807,
+            "end": 48302774,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/1x/pegi18.png",
+            "filename": "/Mods/POLTERWORX/assets/1x/default/j_jen_rot.png",
             "crunched": 0,
-            "start": 46858372,
-            "end": 46859065,
+            "start": 48302774,
+            "end": 48306252,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/1x/petrification_device.png",
+            "filename": "/Mods/POLTERWORX/assets/1x/default/j_jen_ruler.png",
             "crunched": 0,
-            "start": 46859065,
-            "end": 46865827,
+            "start": 48306252,
+            "end": 48307536,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/1x/phone.png",
+            "filename": "/Mods/POLTERWORX/assets/1x/default/j_jen_saint.png",
             "crunched": 0,
-            "start": 46865827,
-            "end": 46913679,
+            "start": 48307536,
+            "end": 48317138,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/1x/photograph_fixed.png",
+            "filename": "/Mods/POLTERWORX/assets/1x/default/j_jen_sappy.png",
             "crunched": 0,
-            "start": 46913679,
-            "end": 46922547,
+            "start": 48317138,
+            "end": 48320349,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/1x/pi.png",
+            "filename": "/Mods/POLTERWORX/assets/1x/default/j_jen_shamura.png",
             "crunched": 0,
-            "start": 46922547,
-            "end": 46928085,
+            "start": 48320349,
+            "end": 48321633,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/1x/prophecy.png",
+            "filename": "/Mods/POLTERWORX/assets/1x/default/j_jen_sigil.png",
             "crunched": 0,
-            "start": 46928085,
-            "end": 46938975,
+            "start": 48321633,
+            "end": 48333564,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/1x/rabbit_clock.png",
+            "filename": "/Mods/POLTERWORX/assets/1x/default/j_jen_slayer.png",
             "crunched": 0,
-            "start": 46938975,
-            "end": 46940365,
+            "start": 48333564,
+            "end": 48334848,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/1x/rainbow.png",
+            "filename": "/Mods/POLTERWORX/assets/1x/default/j_jen_sleveldoohickey.png",
             "crunched": 0,
-            "start": 46940365,
-            "end": 46941516,
+            "start": 48334848,
+            "end": 48336132,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/1x/reboot_card.png",
+            "filename": "/Mods/POLTERWORX/assets/1x/default/j_jen_spearmaster.png",
             "crunched": 0,
-            "start": 46941516,
-            "end": 46945670,
+            "start": 48336132,
+            "end": 48339485,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/1x/redacted.png",
+            "filename": "/Mods/POLTERWORX/assets/1x/default/j_jen_spectraldoohickey.png",
             "crunched": 0,
-            "start": 46945670,
-            "end": 46946576,
+            "start": 48339485,
+            "end": 48340415,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/1x/reinforced.png",
+            "filename": "/Mods/POLTERWORX/assets/1x/default/j_jen_survivor.png",
             "crunched": 0,
-            "start": 46946576,
-            "end": 46947565,
+            "start": 48340415,
+            "end": 48342532,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/1x/rigged.png",
+            "filename": "/Mods/POLTERWORX/assets/1x/default/j_jen_swabbie.png",
             "crunched": 0,
-            "start": 46947565,
-            "end": 46955370,
+            "start": 48342532,
+            "end": 48352110,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/1x/rixy.png",
+            "filename": "/Mods/POLTERWORX/assets/1x/default/j_jen_tarotdoohickey.png",
             "crunched": 0,
-            "start": 46955370,
-            "end": 46966356,
+            "start": 48352110,
+            "end": 48353040,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/1x/rtl.png",
+            "filename": "/Mods/POLTERWORX/assets/1x/default/j_jen_thomas.png",
             "crunched": 0,
-            "start": 46966356,
-            "end": 46967596,
+            "start": 48353040,
+            "end": 48355908,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/1x/scaling.png",
+            "filename": "/Mods/POLTERWORX/assets/1x/default/j_jen_toodles.png",
             "crunched": 0,
-            "start": 46967596,
-            "end": 46968907,
+            "start": 48355908,
+            "end": 48358748,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/1x/sigil_joker.png",
+            "filename": "/Mods/POLTERWORX/assets/1x/default/j_jen_urizyth.png",
             "crunched": 0,
-            "start": 46968907,
-            "end": 46969856,
+            "start": 48358748,
+            "end": 48375062,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/1x/sigil.png",
+            "filename": "/Mods/POLTERWORX/assets/1x/default/j_jen_vacuum.png",
             "crunched": 0,
-            "start": 46969856,
-            "end": 46970741,
+            "start": 48375062,
+            "end": 48396157,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/1x/simp.png",
+            "filename": "/Mods/POLTERWORX/assets/1x/default/j_jen_warlord.png",
             "crunched": 0,
-            "start": 46970741,
-            "end": 46976357,
+            "start": 48396157,
+            "end": 48397441,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/1x/slothful.png",
+            "filename": "/Mods/POLTERWORX/assets/1x/default/j_jen_zignorp.png",
             "crunched": 0,
-            "start": 46976357,
-            "end": 46980864,
+            "start": 48397441,
+            "end": 48410398,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/1x/squared.png",
+            "filename": "/Mods/POLTERWORX/assets/1x/default/jen_bishop.png",
             "crunched": 0,
-            "start": 46980864,
-            "end": 46986794,
+            "start": 48410398,
+            "end": 48446789,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/1x/star_sticker.png",
+            "filename": "/Mods/POLTERWORX/assets/1x/default/jen_legend.png",
             "crunched": 0,
-            "start": 46986794,
-            "end": 46987356,
+            "start": 48446789,
+            "end": 48487117,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/1x/swapping.png",
+            "filename": "/Mods/POLTERWORX/assets/1x/default/jen_pentagram_bloom.png",
             "crunched": 0,
-            "start": 46987356,
-            "end": 46990462,
+            "start": 48487117,
+            "end": 48555262,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/1x/template thunder.png",
+            "filename": "/Mods/POLTERWORX/assets/1x/default/jen_pentagram.png",
             "crunched": 0,
-            "start": 46990462,
-            "end": 46991943,
+            "start": 48555262,
+            "end": 48668890,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/1x/thatcher.png",
+            "filename": "/Mods/POLTERWORX/assets/1x/default/jen_placeholders.png",
             "crunched": 0,
-            "start": 46991943,
-            "end": 46993127,
+            "start": 48668890,
+            "end": 48682134,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/1x/the_gathering.png",
+            "filename": "/Mods/POLTERWORX/assets/1x/default/jen_ui_buttons.png",
             "crunched": 0,
-            "start": 46993127,
-            "end": 46994647,
+            "start": 48682134,
+            "end": 48682843,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/1x/the_solo.png",
+            "filename": "/Mods/POLTERWORX/assets/1x/default/m_jen_enhancements.png",
             "crunched": 0,
-            "start": 46994647,
-            "end": 46996136,
+            "start": 48682843,
+            "end": 48793286,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/1x/the_squad.png",
+            "filename": "/Mods/POLTERWORX/assets/1x/default/oxy_saw.png",
             "crunched": 0,
-            "start": 46996136,
-            "end": 46997641,
+            "start": 48793286,
+            "end": 48796213,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/1x/the_twins.png",
+            "filename": "/Mods/POLTERWORX/assets/1x/default/p_jen_boosters.png",
             "crunched": 0,
-            "start": 46997641,
-            "end": 46999165,
+            "start": 48796213,
+            "end": 48974949,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/1x/titlescreen.png",
+            "filename": "/Mods/POLTERWORX/assets/1x/default/pixel_pet_glow.png",
             "crunched": 0,
-            "start": 46999165,
-            "end": 47000850,
+            "start": 48974949,
+            "end": 48979604,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/1x/toilet_paper.png",
+            "filename": "/Mods/POLTERWORX/assets/1x/default/pixel_pet.png",
             "crunched": 0,
-            "start": 47000850,
-            "end": 47006525,
+            "start": 48979604,
+            "end": 48983587,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/1x/tycoon.png",
+            "filename": "/Mods/POLTERWORX/assets/1x/default/tag_jen.png",
             "crunched": 0,
-            "start": 47006525,
-            "end": 47007566,
+            "start": 48983587,
+            "end": 48991253,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/1x/unope_pack.png",
+            "filename": "/Mods/POLTERWORX/assets/1x/default/v_jen_vouchers.png",
             "crunched": 0,
-            "start": 47007566,
-            "end": 47009269,
+            "start": 48991253,
+            "end": 49040519,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/1x/upgrade.png",
+            "filename": "/Mods/POLTERWORX/assets/1x/polterworx_avatar.png",
             "crunched": 0,
-            "start": 47009269,
-            "end": 47010571,
+            "start": 49040519,
+            "end": 49042129,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/1x/upgraded_deck.png",
+            "filename": "/Mods/POLTERWORX/assets/2x/default/b_jen_decks.png",
             "crunched": 0,
-            "start": 47010571,
-            "end": 47012827,
+            "start": 49042129,
+            "end": 49180371,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/1x/verity_mad.png",
+            "filename": "/Mods/POLTERWORX/assets/2x/default/bl_jen_blinds.png",
             "crunched": 0,
-            "start": 47012827,
-            "end": 47016334,
+            "start": 49180371,
+            "end": 49223079,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/1x/verity.png",
+            "filename": "/Mods/POLTERWORX/assets/2x/default/bl_jen_epic_blinds.png",
             "crunched": 0,
-            "start": 47016334,
-            "end": 47019828,
+            "start": 49223079,
+            "end": 50020241,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/1x/waffle.png",
+            "filename": "/Mods/POLTERWORX/assets/2x/default/bl_jen_legendary_crimson_heart.png",
             "crunched": 0,
-            "start": 47019828,
-            "end": 47033410,
+            "start": 50020241,
+            "end": 50790044,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/1x/webdriver.png",
+            "filename": "/Mods/POLTERWORX/assets/2x/default/c_jen_acc.png",
             "crunched": 0,
-            "start": 47033410,
-            "end": 47034023,
+            "start": 50790044,
+            "end": 50887835,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/1x/wild.png",
+            "filename": "/Mods/POLTERWORX/assets/2x/default/c_jen_artificer.png",
             "crunched": 0,
-            "start": 47034023,
-            "end": 47040717,
+            "start": 50887835,
+            "end": 50895886,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/1x/wind.png",
+            "filename": "/Mods/POLTERWORX/assets/2x/default/c_jen_blanks.png",
             "crunched": 0,
-            "start": 47040717,
-            "end": 47049616,
+            "start": 50895886,
+            "end": 50898493,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/1x/windtrackball.png",
+            "filename": "/Mods/POLTERWORX/assets/2x/default/c_jen_bottles.png",
             "crunched": 0,
-            "start": 47049616,
-            "end": 47050569,
+            "start": 50898493,
+            "end": 50902731,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/1x/wordle.png",
+            "filename": "/Mods/POLTERWORX/assets/2x/default/c_jen_consumables1.png",
             "crunched": 0,
-            "start": 47050569,
-            "end": 47051609,
+            "start": 50902731,
+            "end": 50953883,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/1x/yeah.png",
+            "filename": "/Mods/POLTERWORX/assets/2x/default/c_jen_consumables2.png",
             "crunched": 0,
-            "start": 47051609,
-            "end": 47055460,
+            "start": 50953883,
+            "end": 51005035,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/2x/👀.png",
+            "filename": "/Mods/POLTERWORX/assets/2x/default/c_jen_consumables3.png",
             "crunched": 0,
-            "start": 47055460,
-            "end": 47056917,
+            "start": 51005035,
+            "end": 51056187,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/2x/all_in.png",
+            "filename": "/Mods/POLTERWORX/assets/2x/default/c_jen_fuse.png",
             "crunched": 0,
-            "start": 47056917,
-            "end": 47071513,
+            "start": 51056187,
+            "end": 51069118,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/2x/alphonse.png",
+            "filename": "/Mods/POLTERWORX/assets/2x/default/c_jen_goob.png",
             "crunched": 0,
-            "start": 47071513,
-            "end": 47087011,
+            "start": 51069118,
+            "end": 51073774,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/2x/arrowace.png",
+            "filename": "/Mods/POLTERWORX/assets/2x/default/c_jen_greyhole.png",
             "crunched": 0,
-            "start": 47087011,
-            "end": 47088136,
+            "start": 51073774,
+            "end": 51074645,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/2x/backpack.png",
+            "filename": "/Mods/POLTERWORX/assets/2x/default/c_jen_hoxxes.png",
             "crunched": 0,
-            "start": 47088136,
-            "end": 47091914,
+            "start": 51074645,
+            "end": 51075906,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/2x/bea.png",
+            "filename": "/Mods/POLTERWORX/assets/2x/default/c_jen_huge.png",
             "crunched": 0,
-            "start": 47091914,
-            "end": 47106860,
+            "start": 51075906,
+            "end": 51077878,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/2x/bluegem.png",
+            "filename": "/Mods/POLTERWORX/assets/2x/default/c_jen_nyx.png",
             "crunched": 0,
-            "start": 47106860,
-            "end": 47113532,
+            "start": 51077878,
+            "end": 51092456,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/2x/bro_has_the_key.png",
+            "filename": "/Mods/POLTERWORX/assets/2x/default/c_jen_omegaplanets.png",
             "crunched": 0,
-            "start": 47113532,
-            "end": 47114927,
+            "start": 51092456,
+            "end": 51380649,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/2x/caixinha.png",
+            "filename": "/Mods/POLTERWORX/assets/2x/default/c_jen_omegaspectrals.png",
             "crunched": 0,
-            "start": 47114927,
-            "end": 47122337,
+            "start": 51380649,
+            "end": 51557225,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/2x/calculator.png",
+            "filename": "/Mods/POLTERWORX/assets/2x/default/c_jen_omegatarots.png",
             "crunched": 0,
-            "start": 47122337,
-            "end": 47126303,
+            "start": 51557225,
+            "end": 51877196,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/2x/calculator2.png",
+            "filename": "/Mods/POLTERWORX/assets/2x/default/c_jen_planets.png",
             "crunched": 0,
-            "start": 47126303,
-            "end": 47127754,
+            "start": 51877196,
+            "end": 52029664,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/2x/chatgpt.png",
+            "filename": "/Mods/POLTERWORX/assets/2x/default/c_jen_reversetarots.png",
             "crunched": 0,
-            "start": 47127754,
-            "end": 47137403,
+            "start": 52029664,
+            "end": 52110749,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/2x/cinder_block.png",
+            "filename": "/Mods/POLTERWORX/assets/2x/default/c_jen_swabbie.png",
             "crunched": 0,
-            "start": 47137403,
-            "end": 47138889,
+            "start": 52110749,
+            "end": 52123000,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/2x/coloring_book.png",
+            "filename": "/Mods/POLTERWORX/assets/2x/default/c_jen_tokens.png",
             "crunched": 0,
-            "start": 47138889,
-            "end": 47145782,
+            "start": 52123000,
+            "end": 52231916,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/2x/concrete.png",
+            "filename": "/Mods/POLTERWORX/assets/2x/default/c_jen_uno.png",
             "crunched": 0,
-            "start": 47145782,
-            "end": 47148164,
+            "start": 52231916,
+            "end": 52351020,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/2x/crafting_table.png",
+            "filename": "/Mods/POLTERWORX/assets/2x/default/c_jen_yawetag.png",
             "crunched": 0,
-            "start": 47148164,
-            "end": 47152740,
+            "start": 52351020,
+            "end": 52355510,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/2x/crafting_voucher.png",
+            "filename": "/Mods/POLTERWORX/assets/2x/default/enemy_jen_goob.png",
             "crunched": 0,
-            "start": 47152740,
-            "end": 47153853,
+            "start": 52355510,
+            "end": 52364571,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/2x/creditcard_inbuffonpack.png",
+            "filename": "/Mods/POLTERWORX/assets/2x/default/iamjustsittinghere.png",
             "crunched": 0,
-            "start": 47153853,
-            "end": 47157002,
+            "start": 52364571,
+            "end": 52392218,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/2x/cryptid_reference.png",
+            "filename": "/Mods/POLTERWORX/assets/2x/default/j_jen_7granddad.png",
             "crunched": 0,
-            "start": 47157002,
-            "end": 47172124,
+            "start": 52392218,
+            "end": 52395392,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/2x/d100.png",
+            "filename": "/Mods/POLTERWORX/assets/2x/default/j_jen_alice.png",
             "crunched": 0,
-            "start": 47172124,
-            "end": 47201144,
+            "start": 52395392,
+            "end": 52406571,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/2x/diamond.png",
+            "filename": "/Mods/POLTERWORX/assets/2x/default/j_jen_amalgam.png",
             "crunched": 0,
-            "start": 47201144,
-            "end": 47204970,
+            "start": 52406571,
+            "end": 52408102,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/2x/disco.png",
+            "filename": "/Mods/POLTERWORX/assets/2x/default/j_jen_artificer.png",
             "crunched": 0,
-            "start": 47204970,
-            "end": 47237535,
+            "start": 52408102,
+            "end": 52412505,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/2x/dubai_chocolate.png",
+            "filename": "/Mods/POLTERWORX/assets/2x/default/j_jen_astro.png",
             "crunched": 0,
-            "start": 47237535,
-            "end": 47239199,
+            "start": 52412505,
+            "end": 52423374,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/2x/embed_fail_card.png",
+            "filename": "/Mods/POLTERWORX/assets/2x/default/j_jen_aym.png",
             "crunched": 0,
-            "start": 47239199,
-            "end": 47239937,
+            "start": 52423374,
+            "end": 52430159,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/2x/embed_fail.png",
+            "filename": "/Mods/POLTERWORX/assets/2x/default/j_jen_baal.png",
             "crunched": 0,
-            "start": 47239937,
-            "end": 47240990,
+            "start": 52430159,
+            "end": 52437325,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/2x/epic_games.png",
+            "filename": "/Mods/POLTERWORX/assets/2x/default/j_jen_bhdoohickey.png",
             "crunched": 0,
-            "start": 47240990,
-            "end": 47242048,
+            "start": 52437325,
+            "end": 52438856,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/2x/error.png",
+            "filename": "/Mods/POLTERWORX/assets/2x/default/j_jen_blighter.png",
             "crunched": 0,
-            "start": 47242048,
-            "end": 47245088,
+            "start": 52438856,
+            "end": 52451889,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/2x/formula.png",
+            "filename": "/Mods/POLTERWORX/assets/2x/default/j_jen_boosterdoohickey.png",
             "crunched": 0,
-            "start": 47245088,
-            "end": 47246513,
+            "start": 52451889,
+            "end": 52454142,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/2x/fortnite.png",
+            "filename": "/Mods/POLTERWORX/assets/2x/default/j_jen_boxten.png",
             "crunched": 0,
-            "start": 47246513,
-            "end": 47255140,
+            "start": 52454142,
+            "end": 52457855,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/2x/foto.png",
+            "filename": "/Mods/POLTERWORX/assets/2x/default/j_jen_bulwark.png",
             "crunched": 0,
-            "start": 47255140,
-            "end": 47256606,
+            "start": 52457855,
+            "end": 52478730,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/2x/foto2.png",
+            "filename": "/Mods/POLTERWORX/assets/2x/default/j_jen_charred.png",
             "crunched": 0,
-            "start": 47256606,
-            "end": 47273753,
+            "start": 52478730,
+            "end": 52504606,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/2x/free_wifi.png",
+            "filename": "/Mods/POLTERWORX/assets/2x/default/j_jen_cheese.png",
             "crunched": 0,
-            "start": 47273753,
-            "end": 47274896,
+            "start": 52504606,
+            "end": 52509542,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/2x/frutiger_aero.png",
+            "filename": "/Mods/POLTERWORX/assets/2x/default/j_jen_chemach.png",
             "crunched": 0,
-            "start": 47274896,
-            "end": 47294214,
+            "start": 52509542,
+            "end": 52511795,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/2x/fuckass_dog.png",
+            "filename": "/Mods/POLTERWORX/assets/2x/default/j_jen_chester.png",
             "crunched": 0,
-            "start": 47294214,
-            "end": 47351059,
+            "start": 52511795,
+            "end": 52522155,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/2x/gambling.png",
+            "filename": "/Mods/POLTERWORX/assets/2x/default/j_jen_cilantro.png",
             "crunched": 0,
-            "start": 47351059,
-            "end": 47353528,
+            "start": 52522155,
+            "end": 52540454,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/2x/gaster.png",
+            "filename": "/Mods/POLTERWORX/assets/2x/default/j_jen_clauneck.png",
             "crunched": 0,
-            "start": 47353528,
-            "end": 47362192,
+            "start": 52540454,
+            "end": 52541985,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/2x/golden_cookie.png",
+            "filename": "/Mods/POLTERWORX/assets/2x/default/j_jen_codedoohickey.png",
             "crunched": 0,
-            "start": 47362192,
-            "end": 47380761,
+            "start": 52541985,
+            "end": 52543516,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/2x/goodbelisk.png",
+            "filename": "/Mods/POLTERWORX/assets/2x/default/j_jen_connie.png",
             "crunched": 0,
-            "start": 47380761,
-            "end": 47388863,
+            "start": 52543516,
+            "end": 52555596,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/2x/gravestone.png",
+            "filename": "/Mods/POLTERWORX/assets/2x/default/j_jen_consumeabledoohickey.png",
             "crunched": 0,
-            "start": 47388863,
-            "end": 47406947,
+            "start": 52555596,
+            "end": 52557849,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/2x/greg_materials.png",
+            "filename": "/Mods/POLTERWORX/assets/2x/default/j_jen_cosmo.png",
             "crunched": 0,
-            "start": 47406947,
-            "end": 47425992,
+            "start": 52557849,
+            "end": 52569775,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/2x/greg_pack.png",
+            "filename": "/Mods/POLTERWORX/assets/2x/default/j_jen_cracked.png",
             "crunched": 0,
-            "start": 47425992,
-            "end": 47436438,
+            "start": 52569775,
+            "end": 52588637,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/2x/gregdeck.png",
+            "filename": "/Mods/POLTERWORX/assets/2x/default/j_jen_crimbo.png",
             "crunched": 0,
-            "start": 47436438,
-            "end": 47444768,
+            "start": 52588637,
+            "end": 52606849,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/2x/gregorius.png",
+            "filename": "/Mods/POLTERWORX/assets/2x/default/j_jen_crystal.png",
             "crunched": 0,
-            "start": 47444768,
-            "end": 47446119,
+            "start": 52606849,
+            "end": 52622114,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/2x/h&s.png",
+            "filename": "/Mods/POLTERWORX/assets/2x/default/j_jen_dandy.png",
             "crunched": 0,
-            "start": 47446119,
-            "end": 47448745,
+            "start": 52622114,
+            "end": 52646294,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/2x/HTML_pro.png",
+            "filename": "/Mods/POLTERWORX/assets/2x/default/j_jen_datura.png",
             "crunched": 0,
-            "start": 47448745,
-            "end": 47450426,
+            "start": 52646294,
+            "end": 52663244,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/2x/icon.png",
+            "filename": "/Mods/POLTERWORX/assets/2x/default/j_jen_drago.png",
             "crunched": 0,
-            "start": 47450426,
-            "end": 47451223,
+            "start": 52663244,
+            "end": 52670853,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/2x/infinity.png",
+            "filename": "/Mods/POLTERWORX/assets/2x/default/j_jen_dragofiend.png",
             "crunched": 0,
-            "start": 47451223,
-            "end": 47453702,
+            "start": 52670853,
+            "end": 52680200,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/2x/job.png",
+            "filename": "/Mods/POLTERWORX/assets/2x/default/j_jen_escapey.png",
             "crunched": 0,
-            "start": 47453702,
-            "end": 47456909,
+            "start": 52680200,
+            "end": 52683475,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/2x/jumbo_omega_pack.png",
+            "filename": "/Mods/POLTERWORX/assets/2x/default/j_jen_faceless.png",
             "crunched": 0,
-            "start": 47456909,
-            "end": 47461618,
+            "start": 52683475,
+            "end": 52705575,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/2x/jv.png",
+            "filename": "/Mods/POLTERWORX/assets/2x/default/j_jen_finn.png",
             "crunched": 0,
-            "start": 47461618,
-            "end": 47474416,
+            "start": 52705575,
+            "end": 52710451,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/2x/keep_gambling.png",
+            "filename": "/Mods/POLTERWORX/assets/2x/default/j_jen_gamingchair.png",
             "crunched": 0,
-            "start": 47474416,
-            "end": 47517223,
+            "start": 52710451,
+            "end": 52724031,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/2x/labubu_joker.png",
+            "filename": "/Mods/POLTERWORX/assets/2x/default/j_jen_georgetta.png",
             "crunched": 0,
-            "start": 47517223,
-            "end": 47553216,
+            "start": 52724031,
+            "end": 52737976,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/2x/le_triangle.png",
+            "filename": "/Mods/POLTERWORX/assets/2x/default/j_jen_glisten.png",
             "crunched": 0,
-            "start": 47553216,
-            "end": 47570529,
+            "start": 52737976,
+            "end": 52748350,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/2x/local58.png",
+            "filename": "/Mods/POLTERWORX/assets/2x/default/j_jen_godsmarble.png",
             "crunched": 0,
-            "start": 47570529,
-            "end": 47583208,
+            "start": 52748350,
+            "end": 52782350,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/2x/loss.png",
+            "filename": "/Mods/POLTERWORX/assets/2x/default/j_jen_goob_lefthand.png",
             "crunched": 0,
-            "start": 47583208,
-            "end": 47583981,
+            "start": 52782350,
+            "end": 52785474,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/2x/mega_omega_pack.png",
+            "filename": "/Mods/POLTERWORX/assets/2x/default/j_jen_goob_righthand.png",
             "crunched": 0,
-            "start": 47583981,
-            "end": 47589206,
+            "start": 52785474,
+            "end": 52788575,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/2x/minecraft.png",
+            "filename": "/Mods/POLTERWORX/assets/2x/default/j_jen_goob.png",
             "crunched": 0,
-            "start": 47589206,
-            "end": 47591482,
+            "start": 52788575,
+            "end": 52794209,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/2x/mmorpg.png",
+            "filename": "/Mods/POLTERWORX/assets/2x/default/j_jen_gourmand.png",
             "crunched": 0,
-            "start": 47591482,
-            "end": 47593099,
+            "start": 52794209,
+            "end": 52797389,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/2x/moche.png",
+            "filename": "/Mods/POLTERWORX/assets/2x/default/j_jen_haro.png",
             "crunched": 0,
-            "start": 47593099,
-            "end": 47644112,
+            "start": 52797389,
+            "end": 52799642,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/2x/ms_paint.png",
+            "filename": "/Mods/POLTERWORX/assets/2x/default/j_jen_heket.png",
             "crunched": 0,
-            "start": 47644112,
-            "end": 47649955,
+            "start": 52799642,
+            "end": 52826913,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/2x/multiple_choice.png",
+            "filename": "/Mods/POLTERWORX/assets/2x/default/j_jen_honey.png",
             "crunched": 0,
-            "start": 47649955,
-            "end": 47651585,
+            "start": 52826913,
+            "end": 52833086,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/2x/negation.png",
+            "filename": "/Mods/POLTERWORX/assets/2x/default/j_jen_hunter.png",
             "crunched": 0,
-            "start": 47651585,
-            "end": 47653176,
+            "start": 52833086,
+            "end": 52852683,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/2x/nft.png",
+            "filename": "/Mods/POLTERWORX/assets/2x/default/j_jen_indusblue.png",
             "crunched": 0,
-            "start": 47653176,
-            "end": 47654885,
+            "start": 52852683,
+            "end": 52870801,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/2x/nuke.png",
+            "filename": "/Mods/POLTERWORX/assets/2x/default/j_jen_inhabited.png",
             "crunched": 0,
-            "start": 47654885,
-            "end": 47661740,
+            "start": 52870801,
+            "end": 52903086,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/2x/obsidian.png",
+            "filename": "/Mods/POLTERWORX/assets/2x/default/j_jen_jeremy.png",
             "crunched": 0,
-            "start": 47661740,
-            "end": 47668742,
+            "start": 52903086,
+            "end": 52907927,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/2x/omega_deck.png",
+            "filename": "/Mods/POLTERWORX/assets/2x/default/j_jen_jimbo.png",
             "crunched": 0,
-            "start": 47668742,
-            "end": 47671167,
+            "start": 52907927,
+            "end": 52916958,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/2x/omega_joker.png",
+            "filename": "/Mods/POLTERWORX/assets/2x/default/j_jen_kaleido.png",
             "crunched": 0,
-            "start": 47671167,
-            "end": 47678674,
+            "start": 52916958,
+            "end": 52920867,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/2x/omega_pack.png",
+            "filename": "/Mods/POLTERWORX/assets/2x/default/j_jen_kallamar.png",
             "crunched": 0,
-            "start": 47678674,
-            "end": 47682501,
+            "start": 52920867,
+            "end": 52923120,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/2x/omega_suit.png",
+            "filename": "/Mods/POLTERWORX/assets/2x/default/j_jen_kori.png",
             "crunched": 0,
-            "start": 47682501,
-            "end": 47707272,
+            "start": 52923120,
+            "end": 52943244,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/2x/omega_ui.png",
+            "filename": "/Mods/POLTERWORX/assets/2x/default/j_jen_kosmos.png",
             "crunched": 0,
-            "start": 47707272,
-            "end": 47707830,
+            "start": 52943244,
+            "end": 52959657,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/2x/omega_voucher.png",
+            "filename": "/Mods/POLTERWORX/assets/2x/default/j_jen_kudaai.png",
             "crunched": 0,
-            "start": 47707830,
-            "end": 47709701,
+            "start": 52959657,
+            "end": 52961188,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/2x/optimally_packed.png",
+            "filename": "/Mods/POLTERWORX/assets/2x/default/j_jen_lamb.png",
             "crunched": 0,
-            "start": 47709701,
-            "end": 47710886,
+            "start": 52961188,
+            "end": 52963441,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/2x/os_maias.png",
+            "filename": "/Mods/POLTERWORX/assets/2x/default/j_jen_landa.png",
             "crunched": 0,
-            "start": 47710886,
-            "end": 47712724,
+            "start": 52963441,
+            "end": 52981353,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/2x/pass.png",
+            "filename": "/Mods/POLTERWORX/assets/2x/default/j_jen_leshy.png",
             "crunched": 0,
-            "start": 47712724,
-            "end": 47713685,
+            "start": 52981353,
+            "end": 52987566,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/2x/pegi18.png",
+            "filename": "/Mods/POLTERWORX/assets/2x/default/j_jen_lugia.png",
             "crunched": 0,
-            "start": 47713685,
-            "end": 47714607,
+            "start": 52987566,
+            "end": 52996099,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/2x/petrification_device.png",
+            "filename": "/Mods/POLTERWORX/assets/2x/default/j_jen_luke.png",
             "crunched": 0,
-            "start": 47714607,
-            "end": 47723237,
+            "start": 52996099,
+            "end": 52998352,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/2x/phone.png",
+            "filename": "/Mods/POLTERWORX/assets/2x/default/j_jen_math.png",
             "crunched": 0,
-            "start": 47723237,
-            "end": 47789268,
+            "start": 52998352,
+            "end": 53005829,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/2x/photograph_fixed.png",
+            "filename": "/Mods/POLTERWORX/assets/2x/default/j_jen_maxie.png",
             "crunched": 0,
-            "start": 47789268,
-            "end": 47800591,
+            "start": 53005829,
+            "end": 53011675,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/2x/pi.png",
+            "filename": "/Mods/POLTERWORX/assets/2x/default/j_jen_monk.png",
             "crunched": 0,
-            "start": 47800591,
-            "end": 47808576,
+            "start": 53011675,
+            "end": 53014789,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/2x/prophecy.png",
+            "filename": "/Mods/POLTERWORX/assets/2x/default/j_jen_multi.png",
             "crunched": 0,
-            "start": 47808576,
-            "end": 47821654,
+            "start": 53014789,
+            "end": 53023267,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/2x/rabbit_clock.png",
+            "filename": "/Mods/POLTERWORX/assets/2x/default/j_jen_narinder.png",
             "crunched": 0,
-            "start": 47821654,
-            "end": 47823413,
+            "start": 53023267,
+            "end": 53025520,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/2x/rainbow.png",
+            "filename": "/Mods/POLTERWORX/assets/2x/default/j_jen_negativedoohickey.png",
             "crunched": 0,
-            "start": 47823413,
-            "end": 47824786,
+            "start": 53025520,
+            "end": 53027773,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/2x/reboot_card.png",
+            "filename": "/Mods/POLTERWORX/assets/2x/default/j_jen_nexus.png",
             "crunched": 0,
-            "start": 47824786,
-            "end": 47829768,
+            "start": 53027773,
+            "end": 53048961,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/2x/redacted.png",
+            "filename": "/Mods/POLTERWORX/assets/2x/default/j_jen_noise.png",
             "crunched": 0,
-            "start": 47829768,
-            "end": 47830903,
+            "start": 53048961,
+            "end": 53054042,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/2x/reinforced.png",
+            "filename": "/Mods/POLTERWORX/assets/2x/default/j_jen_nubby.png",
             "crunched": 0,
-            "start": 47830903,
-            "end": 47832564,
+            "start": 53054042,
+            "end": 53058333,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/2x/rigged.png",
+            "filename": "/Mods/POLTERWORX/assets/2x/default/j_jen_nyx.png",
             "crunched": 0,
-            "start": 47832564,
-            "end": 47843823,
+            "start": 53058333,
+            "end": 53072993,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/2x/rixy.png",
+            "filename": "/Mods/POLTERWORX/assets/2x/default/j_jen_omegadoohickey.png",
             "crunched": 0,
-            "start": 47843823,
-            "end": 47858513,
+            "start": 53072993,
+            "end": 53075246,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/2x/rtl.png",
+            "filename": "/Mods/POLTERWORX/assets/2x/default/j_jen_onewhowaits.png",
             "crunched": 0,
-            "start": 47858513,
-            "end": 47860030,
+            "start": 53075246,
+            "end": 53077499,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/2x/scaling.png",
+            "filename": "/Mods/POLTERWORX/assets/2x/default/j_jen_oxy.png",
             "crunched": 0,
-            "start": 47860030,
-            "end": 47861742,
+            "start": 53077499,
+            "end": 53094991,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/2x/sigil_joker.png",
+            "filename": "/Mods/POLTERWORX/assets/2x/default/j_jen_p03.png",
             "crunched": 0,
-            "start": 47861742,
-            "end": 47875737,
+            "start": 53094991,
+            "end": 53097244,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/2x/sigil.png",
+            "filename": "/Mods/POLTERWORX/assets/2x/default/j_jen_paragon.png",
             "crunched": 0,
-            "start": 47875737,
-            "end": 47886508,
+            "start": 53097244,
+            "end": 53121288,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/2x/simp.png",
+            "filename": "/Mods/POLTERWORX/assets/2x/default/j_jen_peppino.png",
             "crunched": 0,
-            "start": 47886508,
-            "end": 47894442,
+            "start": 53121288,
+            "end": 53125613,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/2x/slothful.png",
+            "filename": "/Mods/POLTERWORX/assets/2x/default/j_jen_pickel.png",
             "crunched": 0,
-            "start": 47894442,
-            "end": 47900317,
+            "start": 53125613,
+            "end": 53130554,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/2x/squared.png",
+            "filename": "/Mods/POLTERWORX/assets/2x/default/j_jen_pixel.png",
             "crunched": 0,
-            "start": 47900317,
-            "end": 47908792,
+            "start": 53130554,
+            "end": 53137192,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/2x/star_sticker.png",
+            "filename": "/Mods/POLTERWORX/assets/2x/default/j_jen_planetleveldoohickey.png",
             "crunched": 0,
-            "start": 47908792,
-            "end": 47909528,
+            "start": 53137192,
+            "end": 53139445,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/2x/swapping.png",
+            "filename": "/Mods/POLTERWORX/assets/2x/default/j_jen_pldoohickey.png",
             "crunched": 0,
-            "start": 47909528,
-            "end": 47913935,
+            "start": 53139445,
+            "end": 53140976,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/2x/thatcher.png",
+            "filename": "/Mods/POLTERWORX/assets/2x/default/j_jen_queen.png",
             "crunched": 0,
-            "start": 47913935,
-            "end": 47915390,
+            "start": 53140976,
+            "end": 53164062,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/2x/the_gathering.png",
+            "filename": "/Mods/POLTERWORX/assets/2x/default/j_jen_ratau.png",
             "crunched": 0,
-            "start": 47915390,
-            "end": 47917291,
+            "start": 53164062,
+            "end": 53166315,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/2x/the_solo.png",
+            "filename": "/Mods/POLTERWORX/assets/2x/default/j_jen_razzledazzle.png",
             "crunched": 0,
-            "start": 47917291,
-            "end": 47919168,
+            "start": 53166315,
+            "end": 53177314,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/2x/the_squad.png",
+            "filename": "/Mods/POLTERWORX/assets/2x/default/j_jen_rivulet.png",
             "crunched": 0,
-            "start": 47919168,
-            "end": 47921065,
+            "start": 53177314,
+            "end": 53184575,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/2x/the_twins.png",
+            "filename": "/Mods/POLTERWORX/assets/2x/default/j_jen_rot.png",
             "crunched": 0,
-            "start": 47921065,
-            "end": 47922964,
+            "start": 53184575,
+            "end": 53189535,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/2x/titlescreen.png",
+            "filename": "/Mods/POLTERWORX/assets/2x/default/j_jen_ruler.png",
             "crunched": 0,
-            "start": 47922964,
-            "end": 47925032,
+            "start": 53189535,
+            "end": 53191788,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/2x/toilet_paper.png",
+            "filename": "/Mods/POLTERWORX/assets/2x/default/j_jen_saint.png",
             "crunched": 0,
-            "start": 47925032,
-            "end": 47942136,
+            "start": 53191788,
+            "end": 53203930,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/2x/tycoon.png",
+            "filename": "/Mods/POLTERWORX/assets/2x/default/j_jen_sappy.png",
             "crunched": 0,
-            "start": 47942136,
-            "end": 47943426,
+            "start": 53203930,
+            "end": 53208534,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/2x/unope_pack.png",
+            "filename": "/Mods/POLTERWORX/assets/2x/default/j_jen_shamura.png",
             "crunched": 0,
-            "start": 47943426,
-            "end": 47945524,
+            "start": 53208534,
+            "end": 53210787,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/2x/upgrade.png",
+            "filename": "/Mods/POLTERWORX/assets/2x/default/j_jen_sigil.png",
             "crunched": 0,
-            "start": 47945524,
-            "end": 47947410,
+            "start": 53210787,
+            "end": 53226543,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/2x/upgraded_deck.png",
+            "filename": "/Mods/POLTERWORX/assets/2x/default/j_jen_slayer.png",
             "crunched": 0,
-            "start": 47947410,
-            "end": 47949993,
+            "start": 53226543,
+            "end": 53228796,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/2x/verity_mad.png",
+            "filename": "/Mods/POLTERWORX/assets/2x/default/j_jen_sleveldoohickey.png",
             "crunched": 0,
-            "start": 47949993,
-            "end": 47953858,
+            "start": 53228796,
+            "end": 53231049,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/2x/verity.png",
+            "filename": "/Mods/POLTERWORX/assets/2x/default/j_jen_spearmaster.png",
             "crunched": 0,
-            "start": 47953858,
-            "end": 47957717,
+            "start": 53231049,
+            "end": 53235474,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/2x/waffle.png",
+            "filename": "/Mods/POLTERWORX/assets/2x/default/j_jen_spectraldoohickey.png",
             "crunched": 0,
-            "start": 47957717,
-            "end": 48001075,
+            "start": 53235474,
+            "end": 53237005,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/2x/webdriver.png",
+            "filename": "/Mods/POLTERWORX/assets/2x/default/j_jen_survivor.png",
             "crunched": 0,
-            "start": 48001075,
-            "end": 48001860,
+            "start": 53237005,
+            "end": 53240091,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/2x/wild.png",
+            "filename": "/Mods/POLTERWORX/assets/2x/default/j_jen_swabbie.png",
             "crunched": 0,
-            "start": 48001860,
-            "end": 48011499,
+            "start": 53240091,
+            "end": 53252396,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/2x/wind.png",
+            "filename": "/Mods/POLTERWORX/assets/2x/default/j_jen_tarotdoohickey.png",
             "crunched": 0,
-            "start": 48011499,
-            "end": 48037344,
+            "start": 53252396,
+            "end": 53253927,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/2x/windtrackball.png",
+            "filename": "/Mods/POLTERWORX/assets/2x/default/j_jen_thomas.png",
             "crunched": 0,
-            "start": 48037344,
-            "end": 48038507,
+            "start": 53253927,
+            "end": 53257576,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/2x/wordle.png",
+            "filename": "/Mods/POLTERWORX/assets/2x/default/j_jen_toodles.png",
             "crunched": 0,
-            "start": 48038507,
-            "end": 48039899,
+            "start": 53257576,
+            "end": 53261553,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/fonts/Birthlong.ttf",
+            "filename": "/Mods/POLTERWORX/assets/2x/default/j_jen_urizyth.png",
             "crunched": 0,
-            "start": 48039899,
-            "end": 48074187,
+            "start": 53261553,
+            "end": 53282520,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/fonts/Comic Sans.ttf",
+            "filename": "/Mods/POLTERWORX/assets/2x/default/j_jen_vacuum.png",
             "crunched": 0,
-            "start": 48074187,
-            "end": 48319787,
+            "start": 53282520,
+            "end": 53310784,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/fonts/LuckiestGuy.ttf",
+            "filename": "/Mods/POLTERWORX/assets/2x/default/j_jen_warlord.png",
             "crunched": 0,
-            "start": 48319787,
-            "end": 48378111,
+            "start": 53310784,
+            "end": 53313037,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/fonts/PUSAB.ttf",
+            "filename": "/Mods/POLTERWORX/assets/2x/default/j_jen_zignorp.png",
             "crunched": 0,
-            "start": 48378111,
-            "end": 48435107,
+            "start": 53313037,
+            "end": 53329359,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/fonts/Renogare.ttf",
+            "filename": "/Mods/POLTERWORX/assets/2x/default/jen_bishop.png",
             "crunched": 0,
-            "start": 48435107,
-            "end": 48575179,
+            "start": 53329359,
+            "end": 53454142,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/fonts/Satisfontory.ttf",
+            "filename": "/Mods/POLTERWORX/assets/2x/default/jen_legend.png",
             "crunched": 0,
-            "start": 48575179,
-            "end": 48581367,
+            "start": 53454142,
+            "end": 53588707,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/fonts/Symbola.ttf",
+            "filename": "/Mods/POLTERWORX/assets/2x/default/jen_pentagram_bloom.png",
             "crunched": 0,
-            "start": 48581367,
-            "end": 50821467,
+            "start": 53588707,
+            "end": 53705234,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/fonts/times.ttf",
+            "filename": "/Mods/POLTERWORX/assets/2x/default/jen_pentagram.png",
             "crunched": 0,
-            "start": 50821467,
-            "end": 51169455,
+            "start": 53705234,
+            "end": 53891036,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/fonts/Wingdings.ttf",
+            "filename": "/Mods/POLTERWORX/assets/2x/default/jen_placeholders.png",
             "crunched": 0,
-            "start": 51169455,
-            "end": 51237547,
+            "start": 53891036,
+            "end": 53910337,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/sounds/d100.ogg",
+            "filename": "/Mods/POLTERWORX/assets/2x/default/jen_ui_buttons.png",
             "crunched": 0,
-            "start": 51237547,
-            "end": 51253205,
+            "start": 53910337,
+            "end": 53911274,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/sounds/holdup.ogg",
+            "filename": "/Mods/POLTERWORX/assets/2x/default/m_jen_enhancements.png",
             "crunched": 0,
-            "start": 51253205,
-            "end": 51282637,
+            "start": 53911274,
+            "end": 54063013,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/sounds/music_labubu.ogg",
+            "filename": "/Mods/POLTERWORX/assets/2x/default/oxy_saw.png",
             "crunched": 0,
-            "start": 51282637,
-            "end": 52399128,
+            "start": 54063013,
+            "end": 54072524,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/assets/sounds/ok.ogg",
+            "filename": "/Mods/POLTERWORX/assets/2x/default/p_jen_boosters.png",
             "crunched": 0,
-            "start": 52399128,
-            "end": 52420147,
+            "start": 54072524,
+            "end": 54327274,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/crashes.txt",
+            "filename": "/Mods/POLTERWORX/assets/2x/default/pixel_pet_glow.png",
             "crunched": 0,
-            "start": 52420147,
-            "end": 52420150,
+            "start": 54327274,
+            "end": 54335748,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/items/boosters.lua",
+            "filename": "/Mods/POLTERWORX/assets/2x/default/pixel_pet.png",
             "crunched": 0,
-            "start": 52420150,
-            "end": 52426263,
+            "start": 54335748,
+            "end": 54343407,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/items/consumables.lua",
+            "filename": "/Mods/POLTERWORX/assets/2x/default/tag_jen.png",
             "crunched": 0,
-            "start": 52426263,
-            "end": 52443201,
+            "start": 54343407,
+            "end": 54364886,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/items/decks.lua",
+            "filename": "/Mods/POLTERWORX/assets/2x/default/v_jen_vouchers.png",
             "crunched": 0,
-            "start": 52443201,
-            "end": 52445371,
+            "start": 54364886,
+            "end": 54445113,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/items/enchancers.lua",
+            "filename": "/Mods/POLTERWORX/assets/2x/polterworx_avatar.png",
             "crunched": 0,
-            "start": 52445371,
-            "end": 52456476,
+            "start": 54445113,
+            "end": 54447302,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/items/jokers.lua",
+            "filename": "/Mods/POLTERWORX/assets/shaders/background.fs",
             "crunched": 0,
-            "start": 52456476,
-            "end": 52564807,
+            "start": 54447302,
+            "end": 54449206,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/items/menu.lua",
+            "filename": "/Mods/POLTERWORX/assets/shaders/bedrock.fs",
             "crunched": 0,
-            "start": 52564807,
-            "end": 52567423,
+            "start": 54449206,
+            "end": 54454105,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/items/suit_and_rarity.lua",
+            "filename": "/Mods/POLTERWORX/assets/shaders/bismuth.fs",
             "crunched": 0,
-            "start": 52567423,
-            "end": 52568354,
+            "start": 54454105,
+            "end": 54460127,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/items/vouchers.lua",
+            "filename": "/Mods/POLTERWORX/assets/shaders/blaze.fs",
             "crunched": 0,
-            "start": 52568354,
-            "end": 52569443,
+            "start": 54460127,
+            "end": 54465543,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/main.lua",
+            "filename": "/Mods/POLTERWORX/assets/shaders/bloodfoil.fs",
             "crunched": 0,
-            "start": 52569443,
-            "end": 52574757,
+            "start": 54465543,
+            "end": 54471538,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/mod.json",
+            "filename": "/Mods/POLTERWORX/assets/shaders/bubblegum.fs",
             "crunched": 0,
-            "start": 52574757,
-            "end": 52575176,
+            "start": 54471538,
+            "end": 54477643,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/rtl_posts.txt",
+            "filename": "/Mods/POLTERWORX/assets/shaders/bulged.fs",
             "crunched": 0,
-            "start": 52575176,
-            "end": 52575180,
+            "start": 54477643,
+            "end": 54481709,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/sounds/gold_click.ogg",
+            "filename": "/Mods/POLTERWORX/assets/shaders/chromatic.fs",
             "crunched": 0,
-            "start": 52575180,
-            "end": 52587017,
+            "start": 54481709,
+            "end": 54485983,
             "audio": false
         },
         {
-            "filename": "/Mods/OMEGATRO/sounds/ok.ogg",
+            "filename": "/Mods/POLTERWORX/assets/shaders/colouriser.fs",
             "crunched": 0,
-            "start": 52587017,
-            "end": 52608036,
+            "start": 54485983,
+            "end": 54491072,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/shaders/cosmic.fs",
+            "crunched": 0,
+            "start": 54491072,
+            "end": 54496900,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/shaders/diplopia.fs",
+            "crunched": 0,
+            "start": 54496900,
+            "end": 54501986,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/shaders/dithered.fs",
+            "crunched": 0,
+            "start": 54501986,
+            "end": 54508128,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/shaders/encoded.fs",
+            "crunched": 0,
+            "start": 54508128,
+            "end": 54514095,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/shaders/flame.fs",
+            "crunched": 0,
+            "start": 54514095,
+            "end": 54516878,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/shaders/gilded.fs",
+            "crunched": 0,
+            "start": 54516878,
+            "end": 54522706,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/shaders/greymatter.fs",
+            "crunched": 0,
+            "start": 54522706,
+            "end": 54528589,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/shaders/hardstone.fs",
+            "crunched": 0,
+            "start": 54528589,
+            "end": 54533471,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/shaders/ink.fs",
+            "crunched": 0,
+            "start": 54533471,
+            "end": 54539325,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/shaders/ionized.fs",
+            "crunched": 0,
+            "start": 54539325,
+            "end": 54545169,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/shaders/laminated.fs",
+            "crunched": 0,
+            "start": 54545169,
+            "end": 54549927,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/shaders/misprint.fs",
+            "crunched": 0,
+            "start": 54549927,
+            "end": 54554694,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/shaders/missingtexture.fs",
+            "crunched": 0,
+            "start": 54554694,
+            "end": 54559845,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/shaders/moire.fs",
+            "crunched": 0,
+            "start": 54559845,
+            "end": 54565686,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/shaders/mosaic.fs",
+            "crunched": 0,
+            "start": 54565686,
+            "end": 54571418,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/shaders/polygloss.fs",
+            "crunched": 0,
+            "start": 54571418,
+            "end": 54581407,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/shaders/prismatic.fs",
+            "crunched": 0,
+            "start": 54581407,
+            "end": 54587322,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/shaders/reversed.fs",
+            "crunched": 0,
+            "start": 54587322,
+            "end": 54591789,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/shaders/rotated.fs",
+            "crunched": 0,
+            "start": 54591789,
+            "end": 54596509,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/shaders/sepia.fs",
+            "crunched": 0,
+            "start": 54596509,
+            "end": 54601729,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/shaders/sequin.fs",
+            "crunched": 0,
+            "start": 54601729,
+            "end": 54607611,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/shaders/shaderpack_1.fs",
+            "crunched": 0,
+            "start": 54607611,
+            "end": 54613669,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/shaders/shaderpack_4.fs",
+            "crunched": 0,
+            "start": 54613669,
+            "end": 54619699,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/shaders/sharpened.fs",
+            "crunched": 0,
+            "start": 54619699,
+            "end": 54624899,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/shaders/splash.fs",
+            "crunched": 0,
+            "start": 54624899,
+            "end": 54626886,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/shaders/strobe.fs",
+            "crunched": 0,
+            "start": 54626886,
+            "end": 54632768,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/shaders/unreal.fs",
+            "crunched": 0,
+            "start": 54632768,
+            "end": 54638790,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/shaders/watered.fs",
+            "crunched": 0,
+            "start": 54638790,
+            "end": 54643876,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/shaders/wavy.fs",
+            "crunched": 0,
+            "start": 54643876,
+            "end": 54648290,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/shaders/wee.fs",
+            "crunched": 0,
+            "start": 54648290,
+            "end": 54652036,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/shaders/wtfwave.fs",
+            "crunched": 0,
+            "start": 54652036,
+            "end": 54658064,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/alert.ogg",
+            "crunched": 0,
+            "start": 54658064,
+            "end": 54682085,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/alert1.ogg",
+            "crunched": 0,
+            "start": 54682085,
+            "end": 54699381,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/alert2.ogg",
+            "crunched": 0,
+            "start": 54699381,
+            "end": 54720227,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/alert3.ogg",
+            "crunched": 0,
+            "start": 54720227,
+            "end": 54741624,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/alert4.ogg",
+            "crunched": 0,
+            "start": 54741624,
+            "end": 54764832,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/alert5.ogg",
+            "crunched": 0,
+            "start": 54764832,
+            "end": 54790887,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/ambientDramatic.ogg",
+            "crunched": 0,
+            "start": 54790887,
+            "end": 55451021,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/ambientSinister.ogg",
+            "crunched": 0,
+            "start": 55451021,
+            "end": 56077109,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/ambientSurreal1.ogg",
+            "crunched": 0,
+            "start": 56077109,
+            "end": 56298649,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/ambientSurreal2.ogg",
+            "crunched": 0,
+            "start": 56298649,
+            "end": 56694050,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/ambientSurreal3.ogg",
+            "crunched": 0,
+            "start": 56694050,
+            "end": 57946585,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/attack1.ogg",
+            "crunched": 0,
+            "start": 57946585,
+            "end": 57981046,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/attack2.ogg",
+            "crunched": 0,
+            "start": 57981046,
+            "end": 58014665,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/attack3.ogg",
+            "crunched": 0,
+            "start": 58014665,
+            "end": 58048745,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/bingo.ogg",
+            "crunched": 0,
+            "start": 58048745,
+            "end": 58072781,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/boost1.ogg",
+            "crunched": 0,
+            "start": 58072781,
+            "end": 58094139,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/boost2.ogg",
+            "crunched": 0,
+            "start": 58094139,
+            "end": 58114734,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/boost3.ogg",
+            "crunched": 0,
+            "start": 58114734,
+            "end": 58134978,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/boost4.ogg",
+            "crunched": 0,
+            "start": 58134978,
+            "end": 58154079,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/brimstone.ogg",
+            "crunched": 0,
+            "start": 58154079,
+            "end": 58321866,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/chime.ogg",
+            "crunched": 0,
+            "start": 58321866,
+            "end": 58402097,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/click.ogg",
+            "crunched": 0,
+            "start": 58402097,
+            "end": 58407710,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/collapse_1.ogg",
+            "crunched": 0,
+            "start": 58407710,
+            "end": 58426380,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/collapse_2.ogg",
+            "crunched": 0,
+            "start": 58426380,
+            "end": 58449626,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/collapse_3.ogg",
+            "crunched": 0,
+            "start": 58449626,
+            "end": 58473976,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/collapse_4.ogg",
+            "crunched": 0,
+            "start": 58473976,
+            "end": 58500920,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/collapse_5.ogg",
+            "crunched": 0,
+            "start": 58500920,
+            "end": 58542460,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/crack1.ogg",
+            "crunched": 0,
+            "start": 58542460,
+            "end": 58550174,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/crack2.ogg",
+            "crunched": 0,
+            "start": 58550174,
+            "end": 58561193,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/cry.ogg",
+            "crunched": 0,
+            "start": 58561193,
+            "end": 58601408,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/crystal_break.ogg",
+            "crunched": 0,
+            "start": 58601408,
+            "end": 58617201,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/crystal_hit1.ogg",
+            "crunched": 0,
+            "start": 58617201,
+            "end": 58626572,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/crystal_hit2.ogg",
+            "crunched": 0,
+            "start": 58626572,
+            "end": 58635928,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/crystal_hit3.ogg",
+            "crunched": 0,
+            "start": 58635928,
+            "end": 58647088,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/done.ogg",
+            "crunched": 0,
+            "start": 58647088,
+            "end": 58670855,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/draw.ogg",
+            "crunched": 0,
+            "start": 58670855,
+            "end": 58676377,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/e_bismuth.ogg",
+            "crunched": 0,
+            "start": 58676377,
+            "end": 58735118,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/e_blaze.ogg",
+            "crunched": 0,
+            "start": 58735118,
+            "end": 58761759,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/e_chromatic.ogg",
+            "crunched": 0,
+            "start": 58761759,
+            "end": 58799621,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/e_crystal.ogg",
+            "crunched": 0,
+            "start": 58799621,
+            "end": 58831148,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/e_diplopia.ogg",
+            "crunched": 0,
+            "start": 58831148,
+            "end": 58859219,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/e_dithered.ogg",
+            "crunched": 0,
+            "start": 58859219,
+            "end": 58866829,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/e_encoded.ogg",
+            "crunched": 0,
+            "start": 58866829,
+            "end": 58904480,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/e_gemstone.ogg",
+            "crunched": 0,
+            "start": 58904480,
+            "end": 58934780,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/e_gilded.ogg",
+            "crunched": 0,
+            "start": 58934780,
+            "end": 58959590,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/e_greymatter.ogg",
+            "crunched": 0,
+            "start": 58959590,
+            "end": 58995383,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/e_ink.ogg",
+            "crunched": 0,
+            "start": 58995383,
+            "end": 59021432,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/e_ionized.ogg",
+            "crunched": 0,
+            "start": 59021432,
+            "end": 59052429,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/e_jumbo.ogg",
+            "crunched": 0,
+            "start": 59052429,
+            "end": 59080264,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/e_laminated.ogg",
+            "crunched": 0,
+            "start": 59080264,
+            "end": 59088316,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/e_misprint.ogg",
+            "crunched": 0,
+            "start": 59088316,
+            "end": 59109817,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/e_missingtexture.ogg",
+            "crunched": 0,
+            "start": 59109817,
+            "end": 59119158,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/e_moire.ogg",
+            "crunched": 0,
+            "start": 59119158,
+            "end": 59143987,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/e_noisy.ogg",
+            "crunched": 0,
+            "start": 59143987,
+            "end": 59163728,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/e_polygloss.ogg",
+            "crunched": 0,
+            "start": 59163728,
+            "end": 59186509,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/e_prismatic.ogg",
+            "crunched": 0,
+            "start": 59186509,
+            "end": 59211607,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/e_reversed.ogg",
+            "crunched": 0,
+            "start": 59211607,
+            "end": 59231338,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/e_sepia.ogg",
+            "crunched": 0,
+            "start": 59231338,
+            "end": 59254641,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/e_sequin.ogg",
+            "crunched": 0,
+            "start": 59254641,
+            "end": 59269018,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/e_sharpened.ogg",
+            "crunched": 0,
+            "start": 59269018,
+            "end": 59281703,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/e_sinned.ogg",
+            "crunched": 0,
+            "start": 59281703,
+            "end": 59308326,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/e_strobe.ogg",
+            "crunched": 0,
+            "start": 59308326,
+            "end": 59318693,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/e_unreal.ogg",
+            "crunched": 0,
+            "start": 59318693,
+            "end": 59362420,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/e_watered.ogg",
+            "crunched": 0,
+            "start": 59362420,
+            "end": 59370762,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/e_wavy.ogg",
+            "crunched": 0,
+            "start": 59370762,
+            "end": 59393367,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/e_wee.ogg",
+            "crunched": 0,
+            "start": 59393367,
+            "end": 59401716,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/eat.ogg",
+            "crunched": 0,
+            "start": 59401716,
+            "end": 59416016,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/enchant.ogg",
+            "crunched": 0,
+            "start": 59416016,
+            "end": 59451989,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/enlightened.ogg",
+            "crunched": 0,
+            "start": 59451989,
+            "end": 59518552,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/explode_1.ogg",
+            "crunched": 0,
+            "start": 59518552,
+            "end": 59588323,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/explode_2.ogg",
+            "crunched": 0,
+            "start": 59588323,
+            "end": 59634665,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/explode_3.ogg",
+            "crunched": 0,
+            "start": 59634665,
+            "end": 59690415,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/explode_4.ogg",
+            "crunched": 0,
+            "start": 59690415,
+            "end": 59713103,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/explode_5.ogg",
+            "crunched": 0,
+            "start": 59713103,
+            "end": 59757726,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/explode_6.ogg",
+            "crunched": 0,
+            "start": 59757726,
+            "end": 59848346,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/explode_7.ogg",
+            "crunched": 0,
+            "start": 59848346,
+            "end": 59876864,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/explode_8.ogg",
+            "crunched": 0,
+            "start": 59876864,
+            "end": 59917327,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/explode_9.ogg",
+            "crunched": 0,
+            "start": 59917327,
+            "end": 59946343,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/exponentiatehand.ogg",
+            "crunched": 0,
+            "start": 59946343,
+            "end": 59974854,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/fusion_create.ogg",
+            "crunched": 0,
+            "start": 59974854,
+            "end": 59989604,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/fusion_place.ogg",
+            "crunched": 0,
+            "start": 59989604,
+            "end": 60003355,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/gem.ogg",
+            "crunched": 0,
+            "start": 60003355,
+            "end": 60056476,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/gong.ogg",
+            "crunched": 0,
+            "start": 60056476,
+            "end": 60105816,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/gore1.ogg",
+            "crunched": 0,
+            "start": 60105816,
+            "end": 60117809,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/gore2.ogg",
+            "crunched": 0,
+            "start": 60117809,
+            "end": 60133069,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/gore3.ogg",
+            "crunched": 0,
+            "start": 60133069,
+            "end": 60154458,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/gore4.ogg",
+            "crunched": 0,
+            "start": 60154458,
+            "end": 60170832,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/gore5.ogg",
+            "crunched": 0,
+            "start": 60170832,
+            "end": 60190093,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/gore6.ogg",
+            "crunched": 0,
+            "start": 60190093,
+            "end": 60228484,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/gore7.ogg",
+            "crunched": 0,
+            "start": 60228484,
+            "end": 60252864,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/gore8.ogg",
+            "crunched": 0,
+            "start": 60252864,
+            "end": 60268407,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/grand_dad1.ogg",
+            "crunched": 0,
+            "start": 60268407,
+            "end": 60286240,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/grand_dad2.ogg",
+            "crunched": 0,
+            "start": 60286240,
+            "end": 60307093,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/grand_dad3.ogg",
+            "crunched": 0,
+            "start": 60307093,
+            "end": 60325534,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/grand_dad4.ogg",
+            "crunched": 0,
+            "start": 60325534,
+            "end": 60339820,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/grand_dad5.ogg",
+            "crunched": 0,
+            "start": 60339820,
+            "end": 60355101,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/grand_dad6.ogg",
+            "crunched": 0,
+            "start": 60355101,
+            "end": 60370072,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/grindstone.ogg",
+            "crunched": 0,
+            "start": 60370072,
+            "end": 60384768,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/gup.ogg",
+            "crunched": 0,
+            "start": 60384768,
+            "end": 60391128,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/hurt1.ogg",
+            "crunched": 0,
+            "start": 60391128,
+            "end": 60398506,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/hurt2.ogg",
+            "crunched": 0,
+            "start": 60398506,
+            "end": 60405443,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/hurt3.ogg",
+            "crunched": 0,
+            "start": 60405443,
+            "end": 60414045,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/level_up.ogg",
+            "crunched": 0,
+            "start": 60414045,
+            "end": 60498047,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/manjiji_ma.ogg",
+            "crunched": 0,
+            "start": 60498047,
+            "end": 60569985,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/megatrigger.ogg",
+            "crunched": 0,
+            "start": 60569985,
+            "end": 60630038,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/metal_break1.ogg",
+            "crunched": 0,
+            "start": 60630038,
+            "end": 60654736,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/metal_break2.ogg",
+            "crunched": 0,
+            "start": 60654736,
+            "end": 60683793,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/metal_hit.ogg",
+            "crunched": 0,
+            "start": 60683793,
+            "end": 60697476,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/misc1.ogg",
+            "crunched": 0,
+            "start": 60697476,
+            "end": 60730493,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/moan1.ogg",
+            "crunched": 0,
+            "start": 60730493,
+            "end": 60755446,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/moan2.ogg",
+            "crunched": 0,
+            "start": 60755446,
+            "end": 60781977,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/multiplyhand.ogg",
+            "crunched": 0,
+            "start": 60781977,
+            "end": 60800014,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/mushroom1.ogg",
+            "crunched": 0,
+            "start": 60800014,
+            "end": 60814897,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/mushroom2.ogg",
+            "crunched": 0,
+            "start": 60814897,
+            "end": 60830215,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/musicCombat.ogg",
+            "crunched": 0,
+            "start": 60830215,
+            "end": 62320193,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/musicExtraordinary.ogg",
+            "crunched": 0,
+            "start": 62320193,
+            "end": 65029214,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/musicGameshow.ogg",
+            "crunched": 0,
+            "start": 65029214,
+            "end": 66540830,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/musicHighTension.ogg",
+            "crunched": 0,
+            "start": 66540830,
+            "end": 68202467,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/musicHypertensiveCrisis.ogg",
+            "crunched": 0,
+            "start": 68202467,
+            "end": 70065645,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/musicIcon.ogg",
+            "crunched": 0,
+            "start": 70065645,
+            "end": 70869439,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/musicKosmos.ogg",
+            "crunched": 0,
+            "start": 70869439,
+            "end": 71998547,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/musicMatrix.ogg",
+            "crunched": 0,
+            "start": 71998547,
+            "end": 75395774,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/musicPwxMain.ogg",
+            "crunched": 0,
+            "start": 75395774,
+            "end": 77908585,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/musicVelkommen.ogg",
+            "crunched": 0,
+            "start": 77908585,
+            "end": 82605026,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/musicWondrous.ogg",
+            "crunched": 0,
+            "start": 82605026,
+            "end": 85215914,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/omega_card.ogg",
+            "crunched": 0,
+            "start": 85215914,
+            "end": 85255783,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/pan.ogg",
+            "crunched": 0,
+            "start": 85255783,
+            "end": 85267614,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/pixelBeep.ogg",
+            "crunched": 0,
+            "start": 85267614,
+            "end": 85274593,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/plasticButton1.ogg",
+            "crunched": 0,
+            "start": 85274593,
+            "end": 85283545,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/plasticButton2.ogg",
+            "crunched": 0,
+            "start": 85283545,
+            "end": 85292462,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/polytatehand.ogg",
+            "crunched": 0,
+            "start": 85292462,
+            "end": 85413400,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/pop.ogg",
+            "crunched": 0,
+            "start": 85413400,
+            "end": 85440983,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/powerup.ogg",
+            "crunched": 0,
+            "start": 85440983,
+            "end": 85458748,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/relief.ogg",
+            "crunched": 0,
+            "start": 85458748,
+            "end": 85485770,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/rizz.ogg",
+            "crunched": 0,
+            "start": 85485770,
+            "end": 85506252,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/select.ogg",
+            "crunched": 0,
+            "start": 85506252,
+            "end": 85511833,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/snap.ogg",
+            "crunched": 0,
+            "start": 85511833,
+            "end": 85522921,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/squirk.ogg",
+            "crunched": 0,
+            "start": 85522921,
+            "end": 85531075,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/stinger.ogg",
+            "crunched": 0,
+            "start": 85531075,
+            "end": 85646025,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/straddle_increase.ogg",
+            "crunched": 0,
+            "start": 85646025,
+            "end": 85690251,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/straddle_tick.ogg",
+            "crunched": 0,
+            "start": 85690251,
+            "end": 85711730,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/tension.ogg",
+            "crunched": 0,
+            "start": 85711730,
+            "end": 85741767,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/tetratehand.ogg",
+            "crunched": 0,
+            "start": 85741767,
+            "end": 85813298,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/treasure.ogg",
+            "crunched": 0,
+            "start": 85813298,
+            "end": 85856270,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/uno.ogg",
+            "crunched": 0,
+            "start": 85856270,
+            "end": 85877898,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/warning_heartbeat.ogg",
+            "crunched": 0,
+            "start": 85877898,
+            "end": 85899192,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/warning.ogg",
+            "crunched": 0,
+            "start": 85899192,
+            "end": 86030064,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/warningInitial.ogg",
+            "crunched": 0,
+            "start": 86030064,
+            "end": 86043880,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/warningLoop.ogg",
+            "crunched": 0,
+            "start": 86043880,
+            "end": 86056970,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/assets/sounds/wererich.ogg",
+            "crunched": 0,
+            "start": 86056970,
+            "end": 86072685,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/config.lua",
+            "crunched": 0,
+            "start": 86072685,
+            "end": 86072972,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/Jen.json",
+            "crunched": 0,
+            "start": 86072972,
+            "end": 86073791,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/Jen.lua",
+            "crunched": 0,
+            "start": 86073791,
+            "end": 86815150,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/LICENSE",
+            "crunched": 0,
+            "start": 86815150,
+            "end": 86850973,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/localization/en-us.lua",
+            "crunched": 0,
+            "start": 86850973,
+            "end": 86851262,
+            "audio": false
+        },
+        {
+            "filename": "/Mods/POLTERWORX/lovely.toml",
+            "crunched": 0,
+            "start": 86851262,
+            "end": 86908703,
             "audio": false
         },
         {
             "filename": "/Mods/Steamodded/.gitattributes",
             "crunched": 0,
-            "start": 52608036,
-            "end": 52608054,
+            "start": 86908703,
+            "end": 86908721,
             "audio": false
         },
         {
             "filename": "/Mods/Steamodded/.gitignore",
             "crunched": 0,
-            "start": 52608054,
-            "end": 52611957,
+            "start": 86908721,
+            "end": 86912624,
             "audio": false
         },
         {
             "filename": "/Mods/Steamodded/assets/1x/default_achievements.png",
             "crunched": 0,
-            "start": 52611957,
-            "end": 52614893,
+            "start": 86912624,
+            "end": 86915560,
             "audio": false
         },
         {
             "filename": "/Mods/Steamodded/assets/1x/dropdown_arrow.png",
             "crunched": 0,
-            "start": 52614893,
-            "end": 52615647,
+            "start": 86915560,
+            "end": 86916314,
             "audio": false
         },
         {
             "filename": "/Mods/Steamodded/assets/1x/mod_tags.png",
             "crunched": 0,
-            "start": 52615647,
-            "end": 52618681,
+            "start": 86916314,
+            "end": 86919348,
             "audio": false
         },
         {
             "filename": "/Mods/Steamodded/assets/2x/default_achievements.png",
             "crunched": 0,
-            "start": 52618681,
-            "end": 52622445,
+            "start": 86919348,
+            "end": 86923112,
             "audio": false
         },
         {
             "filename": "/Mods/Steamodded/assets/2x/dropdown_arrow.png",
             "crunched": 0,
-            "start": 52622445,
-            "end": 52624023,
+            "start": 86923112,
+            "end": 86924690,
             "audio": false
         },
         {
             "filename": "/Mods/Steamodded/assets/2x/mod_tags.png",
             "crunched": 0,
-            "start": 52624023,
-            "end": 52627951,
+            "start": 86924690,
+            "end": 86928618,
             "audio": false
         },
         {
             "filename": "/Mods/Steamodded/assets/cat.png",
             "crunched": 0,
-            "start": 52627951,
-            "end": 52646888,
+            "start": 86928618,
+            "end": 86947555,
             "audio": false
         },
         {
             "filename": "/Mods/Steamodded/assets/sounds/xblindsize.ogg",
             "crunched": 0,
-            "start": 52646888,
-            "end": 52660249,
+            "start": 86947555,
+            "end": 86960916,
             "audio": false
         },
         {
             "filename": "/Mods/Steamodded/assets/sounds/xchips.ogg",
             "crunched": 0,
-            "start": 52660249,
-            "end": 52685275,
+            "start": 86960916,
+            "end": 86985942,
             "audio": false
         },
         {
             "filename": "/Mods/Steamodded/assets/sounds/xscore.ogg",
             "crunched": 0,
-            "start": 52685275,
-            "end": 52732752,
+            "start": 86985942,
+            "end": 87010826,
             "audio": false
         },
         {
             "filename": "/Mods/Steamodded/config.lua",
             "crunched": 0,
-            "start": 52732752,
-            "end": 52732940,
+            "start": 87010826,
+            "end": 87011014,
             "audio": false
         },
         {
             "filename": "/Mods/Steamodded/icon.png",
             "crunched": 0,
-            "start": 52732940,
-            "end": 52765421,
+            "start": 87011014,
+            "end": 87043495,
             "audio": false
         },
         {
             "filename": "/Mods/Steamodded/libs/https/luajit-curl.lua",
             "crunched": 0,
-            "start": 52765421,
-            "end": 52794160,
+            "start": 87043495,
+            "end": 87072234,
             "audio": false
         },
         {
             "filename": "/Mods/Steamodded/libs/https/smods-https.lua",
             "crunched": 0,
-            "start": 52794160,
-            "end": 52802638,
+            "start": 87072234,
+            "end": 87080712,
             "audio": false
         },
         {
             "filename": "/Mods/Steamodded/libs/json/init.lua",
             "crunched": 0,
-            "start": 52802638,
-            "end": 52802670,
+            "start": 87080712,
+            "end": 87080744,
             "audio": false
         },
         {
             "filename": "/Mods/Steamodded/libs/json/json.lua",
             "crunched": 0,
-            "start": 52802670,
-            "end": 52812307,
+            "start": 87080744,
+            "end": 87090381,
             "audio": false
         },
         {
             "filename": "/Mods/Steamodded/libs/nativefs/icon.png",
             "crunched": 0,
-            "start": 52812307,
-            "end": 52954103,
+            "start": 87090381,
+            "end": 87232177,
             "audio": false
         },
         {
             "filename": "/Mods/Steamodded/libs/nativefs/init.lua",
             "crunched": 0,
-            "start": 52954103,
-            "end": 52954140,
+            "start": 87232177,
+            "end": 87232214,
             "audio": false
         },
         {
             "filename": "/Mods/Steamodded/libs/nativefs/LICENSE",
             "crunched": 0,
-            "start": 52954140,
-            "end": 52955195,
+            "start": 87232214,
+            "end": 87233269,
             "audio": false
         },
         {
             "filename": "/Mods/Steamodded/libs/nativefs/manifest.json",
             "crunched": 0,
-            "start": 52955195,
-            "end": 52955486,
+            "start": 87233269,
+            "end": 87233560,
             "audio": false
         },
         {
             "filename": "/Mods/Steamodded/libs/nativefs/nativefs.lua",
             "crunched": 0,
-            "start": 52955486,
-            "end": 52973700,
+            "start": 87233560,
+            "end": 87251774,
             "audio": false
         },
         {
             "filename": "/Mods/Steamodded/libs/nativefs/README.md",
             "crunched": 0,
-            "start": 52973700,
-            "end": 52979088,
+            "start": 87251774,
+            "end": 87257162,
             "audio": false
         },
         {
             "filename": "/Mods/Steamodded/LICENSE",
             "crunched": 0,
-            "start": 52979088,
-            "end": 53014237,
+            "start": 87257162,
+            "end": 87292311,
             "audio": false
         },
         {
             "filename": "/Mods/Steamodded/localization/de.lua",
             "crunched": 0,
-            "start": 53014237,
-            "end": 53028201,
+            "start": 87292311,
+            "end": 87306275,
             "audio": false
         },
         {
             "filename": "/Mods/Steamodded/localization/en-us.lua",
             "crunched": 0,
-            "start": 53028201,
-            "end": 53040727,
+            "start": 87306275,
+            "end": 87318801,
             "audio": false
         },
         {
             "filename": "/Mods/Steamodded/localization/es_419.lua",
             "crunched": 0,
-            "start": 53040727,
-            "end": 53053991,
+            "start": 87318801,
+            "end": 87332065,
             "audio": false
         },
         {
             "filename": "/Mods/Steamodded/localization/es_ES.lua",
             "crunched": 0,
-            "start": 53053991,
-            "end": 53067254,
+            "start": 87332065,
+            "end": 87345328,
             "audio": false
         },
         {
             "filename": "/Mods/Steamodded/localization/fr.lua",
             "crunched": 0,
-            "start": 53067254,
-            "end": 53075284,
+            "start": 87345328,
+            "end": 87353358,
             "audio": false
         },
         {
             "filename": "/Mods/Steamodded/localization/id.lua",
             "crunched": 0,
-            "start": 53075284,
-            "end": 53076302,
+            "start": 87353358,
+            "end": 87354376,
             "audio": false
         },
         {
             "filename": "/Mods/Steamodded/localization/it.lua",
             "crunched": 0,
-            "start": 53076302,
-            "end": 53082729,
+            "start": 87354376,
+            "end": 87360803,
             "audio": false
         },
         {
             "filename": "/Mods/Steamodded/localization/ja.lua",
             "crunched": 0,
-            "start": 53082729,
-            "end": 53083827,
+            "start": 87360803,
+            "end": 87361901,
             "audio": false
         },
         {
             "filename": "/Mods/Steamodded/localization/ko.lua",
             "crunched": 0,
-            "start": 53083827,
-            "end": 53091276,
+            "start": 87361901,
+            "end": 87369350,
             "audio": false
         },
         {
             "filename": "/Mods/Steamodded/localization/nl.lua",
             "crunched": 0,
-            "start": 53091276,
-            "end": 53092308,
+            "start": 87369350,
+            "end": 87370382,
             "audio": false
         },
         {
             "filename": "/Mods/Steamodded/localization/pl.lua",
             "crunched": 0,
-            "start": 53092308,
-            "end": 53093337,
+            "start": 87370382,
+            "end": 87371411,
             "audio": false
         },
         {
             "filename": "/Mods/Steamodded/localization/pt_BR.lua",
             "crunched": 0,
-            "start": 53093337,
-            "end": 53098692,
+            "start": 87371411,
+            "end": 87376766,
             "audio": false
         },
         {
             "filename": "/Mods/Steamodded/localization/ru.lua",
             "crunched": 0,
-            "start": 53098692,
-            "end": 53108071,
+            "start": 87376766,
+            "end": 87386145,
             "audio": false
         },
         {
             "filename": "/Mods/Steamodded/localization/zh_CN.lua",
             "crunched": 0,
-            "start": 53108071,
-            "end": 53117438,
+            "start": 87386145,
+            "end": 87395512,
             "audio": false
         },
         {
             "filename": "/Mods/Steamodded/localization/zh_TW.lua",
             "crunched": 0,
-            "start": 53117438,
-            "end": 53118446,
+            "start": 87395512,
+            "end": 87396520,
             "audio": false
         },
         {
             "filename": "/Mods/Steamodded/lovely/achievements.toml",
             "crunched": 0,
-            "start": 53118446,
-            "end": 53121991,
+            "start": 87396520,
+            "end": 87400065,
             "audio": false
         },
         {
             "filename": "/Mods/Steamodded/lovely/atlas.toml",
             "crunched": 0,
-            "start": 53121991,
-            "end": 53123126,
+            "start": 87400065,
+            "end": 87401200,
             "audio": false
         },
         {
             "filename": "/Mods/Steamodded/lovely/back.toml",
             "crunched": 0,
-            "start": 53123126,
-            "end": 53128710,
+            "start": 87401200,
+            "end": 87406784,
             "audio": false
         },
         {
             "filename": "/Mods/Steamodded/lovely/better_calc_fixes.toml",
             "crunched": 0,
-            "start": 53128710,
-            "end": 53129710,
+            "start": 87406784,
+            "end": 87407784,
             "audio": false
         },
         {
             "filename": "/Mods/Steamodded/lovely/better_calc.toml",
             "crunched": 0,
-            "start": 53129710,
-            "end": 53200053,
+            "start": 87407784,
+            "end": 87478127,
             "audio": false
         },
         {
             "filename": "/Mods/Steamodded/lovely/blind_score_mod.toml",
             "crunched": 0,
-            "start": 53200053,
-            "end": 53201453,
+            "start": 87478127,
+            "end": 87479527,
             "audio": false
         },
         {
             "filename": "/Mods/Steamodded/lovely/blind_ui.toml",
             "crunched": 0,
-            "start": 53201453,
-            "end": 53208144,
+            "start": 87479527,
+            "end": 87486218,
             "audio": false
         },
         {
             "filename": "/Mods/Steamodded/lovely/blind.toml",
             "crunched": 0,
-            "start": 53208144,
-            "end": 53227224,
+            "start": 87486218,
+            "end": 87505298,
             "audio": false
         },
         {
             "filename": "/Mods/Steamodded/lovely/booster.toml",
             "crunched": 0,
-            "start": 53227224,
-            "end": 53240429,
+            "start": 87505298,
+            "end": 87518503,
             "audio": false
         },
         {
             "filename": "/Mods/Steamodded/lovely/calc_returns.toml",
             "crunched": 0,
-            "start": 53240429,
-            "end": 53241588,
+            "start": 87518503,
+            "end": 87519662,
             "audio": false
         },
         {
             "filename": "/Mods/Steamodded/lovely/calculate_card_added.toml",
             "crunched": 0,
-            "start": 53241588,
-            "end": 53242342,
+            "start": 87519662,
+            "end": 87520416,
             "audio": false
         },
         {
             "filename": "/Mods/Steamodded/lovely/can_calculate.toml",
             "crunched": 0,
-            "start": 53242342,
-            "end": 53243767,
+            "start": 87520416,
+            "end": 87521841,
             "audio": false
         },
         {
             "filename": "/Mods/Steamodded/lovely/card_limit.toml",
             "crunched": 0,
-            "start": 53243767,
-            "end": 53255210,
+            "start": 87521841,
+            "end": 87533284,
             "audio": false
         },
         {
             "filename": "/Mods/Steamodded/lovely/cardarea.toml",
             "crunched": 0,
-            "start": 53255210,
-            "end": 53256401,
+            "start": 87533284,
+            "end": 87534475,
             "audio": false
         },
         {
             "filename": "/Mods/Steamodded/lovely/cardareas.toml",
             "crunched": 0,
-            "start": 53256401,
-            "end": 53257610,
+            "start": 87534475,
+            "end": 87535684,
             "audio": false
         },
         {
             "filename": "/Mods/Steamodded/lovely/center.toml",
             "crunched": 0,
-            "start": 53257610,
-            "end": 53280544,
+            "start": 87535684,
+            "end": 87558618,
             "audio": false
         },
         {
             "filename": "/Mods/Steamodded/lovely/challenge.toml",
             "crunched": 0,
-            "start": 53280544,
-            "end": 53284669,
+            "start": 87558618,
+            "end": 87562743,
             "audio": false
         },
         {
             "filename": "/Mods/Steamodded/lovely/compact_cashout.toml",
             "crunched": 0,
-            "start": 53284669,
-            "end": 53286263,
+            "start": 87562743,
+            "end": 87564337,
             "audio": false
         },
         {
             "filename": "/Mods/Steamodded/lovely/compat_0_9_8.toml",
             "crunched": 0,
-            "start": 53286263,
-            "end": 53287316,
+            "start": 87564337,
+            "end": 87565390,
             "audio": false
         },
         {
             "filename": "/Mods/Steamodded/lovely/core.toml",
             "crunched": 0,
-            "start": 53287316,
-            "end": 53287807,
+            "start": 87565390,
+            "end": 87565881,
             "audio": false
         },
         {
             "filename": "/Mods/Steamodded/lovely/crash_handler.toml",
             "crunched": 0,
-            "start": 53287807,
-            "end": 53288398,
+            "start": 87565881,
+            "end": 87566472,
             "audio": false
         },
         {
             "filename": "/Mods/Steamodded/lovely/create_sprite.toml",
             "crunched": 0,
-            "start": 53288398,
-            "end": 53291551,
+            "start": 87566472,
+            "end": 87569625,
             "audio": false
         },
         {
             "filename": "/Mods/Steamodded/lovely/deck_skins.toml",
             "crunched": 0,
-            "start": 53291551,
-            "end": 53294296,
+            "start": 87569625,
+            "end": 87572370,
             "audio": false
         },
         {
             "filename": "/Mods/Steamodded/lovely/dollar_row.toml",
             "crunched": 0,
-            "start": 53294296,
-            "end": 53297192,
+            "start": 87572370,
+            "end": 87575266,
             "audio": false
         },
         {
             "filename": "/Mods/Steamodded/lovely/dynatext_conditionals.toml",
             "crunched": 0,
-            "start": 53297192,
-            "end": 53299318,
+            "start": 87575266,
+            "end": 87577392,
             "audio": false
         },
         {
             "filename": "/Mods/Steamodded/lovely/easings.toml",
             "crunched": 0,
-            "start": 53299318,
-            "end": 53301419,
+            "start": 87577392,
+            "end": 87579493,
             "audio": false
         },
         {
             "filename": "/Mods/Steamodded/lovely/edition.toml",
             "crunched": 0,
-            "start": 53301419,
-            "end": 53308841,
+            "start": 87579493,
+            "end": 87586915,
             "audio": false
         },
         {
             "filename": "/Mods/Steamodded/lovely/enhancement.toml",
             "crunched": 0,
-            "start": 53308841,
-            "end": 53319101,
+            "start": 87586915,
+            "end": 87597175,
             "audio": false
         },
         {
             "filename": "/Mods/Steamodded/lovely/event.toml",
             "crunched": 0,
-            "start": 53319101,
-            "end": 53320453,
+            "start": 87597175,
+            "end": 87598527,
             "audio": false
         },
         {
             "filename": "/Mods/Steamodded/lovely/fixes.toml",
             "crunched": 0,
-            "start": 53320453,
-            "end": 53347944,
+            "start": 87598527,
+            "end": 87626018,
             "audio": false
         },
         {
             "filename": "/Mods/Steamodded/lovely/gradient.toml",
             "crunched": 0,
-            "start": 53347944,
-            "end": 53349393,
+            "start": 87626018,
+            "end": 87627467,
             "audio": false
         },
         {
             "filename": "/Mods/Steamodded/lovely/hand_limit.toml",
             "crunched": 0,
-            "start": 53349393,
-            "end": 53352209,
+            "start": 87627467,
+            "end": 87630283,
             "audio": false
         },
         {
             "filename": "/Mods/Steamodded/lovely/jimboquip.toml",
             "crunched": 0,
-            "start": 53352209,
-            "end": 53357927,
+            "start": 87630283,
+            "end": 87636001,
             "audio": false
         },
         {
             "filename": "/Mods/Steamodded/lovely/joker_retriggers.toml",
             "crunched": 0,
-            "start": 53357927,
-            "end": 53364923,
+            "start": 87636001,
+            "end": 87642997,
             "audio": false
         },
         {
             "filename": "/Mods/Steamodded/lovely/joker_size.toml",
             "crunched": 0,
-            "start": 53364923,
-            "end": 53367330,
+            "start": 87642997,
+            "end": 87645404,
             "audio": false
         },
         {
             "filename": "/Mods/Steamodded/lovely/keybind.toml",
             "crunched": 0,
-            "start": 53367330,
-            "end": 53369521,
+            "start": 87645404,
+            "end": 87647595,
             "audio": false
         },
         {
             "filename": "/Mods/Steamodded/lovely/language.toml",
             "crunched": 0,
-            "start": 53369521,
-            "end": 53371518,
+            "start": 87647595,
+            "end": 87649592,
             "audio": false
         },
         {
             "filename": "/Mods/Steamodded/lovely/libs.toml",
             "crunched": 0,
-            "start": 53371518,
-            "end": 53372125,
+            "start": 87649592,
+            "end": 87650199,
             "audio": false
         },
         {
             "filename": "/Mods/Steamodded/lovely/listed_probabilities.toml",
             "crunched": 0,
-            "start": 53372125,
-            "end": 53378424,
+            "start": 87650199,
+            "end": 87656498,
             "audio": false
         },
         {
             "filename": "/Mods/Steamodded/lovely/loader.toml",
             "crunched": 0,
-            "start": 53378424,
-            "end": 53378942,
+            "start": 87656498,
+            "end": 87657016,
             "audio": false
         },
         {
             "filename": "/Mods/Steamodded/lovely/menu.toml",
             "crunched": 0,
-            "start": 53378942,
-            "end": 53381121,
+            "start": 87657016,
+            "end": 87659195,
             "audio": false
         },
         {
             "filename": "/Mods/Steamodded/lovely/mobile_patches.toml",
             "crunched": 0,
-            "start": 53381121,
-            "end": 53383523,
+            "start": 87659195,
+            "end": 87661597,
             "audio": false
         },
         {
             "filename": "/Mods/Steamodded/lovely/mod.toml",
             "crunched": 0,
-            "start": 53383523,
-            "end": 53385278,
+            "start": 87661597,
+            "end": 87663352,
             "audio": false
         },
         {
             "filename": "/Mods/Steamodded/lovely/multi_box_descriptions.toml",
             "crunched": 0,
-            "start": 53385278,
-            "end": 53391005,
+            "start": 87663352,
+            "end": 87669079,
             "audio": false
         },
         {
             "filename": "/Mods/Steamodded/lovely/number_formatting.toml",
             "crunched": 0,
-            "start": 53391005,
-            "end": 53395746,
+            "start": 87669079,
+            "end": 87673820,
             "audio": false
         },
         {
             "filename": "/Mods/Steamodded/lovely/override_notice.toml",
             "crunched": 0,
-            "start": 53395746,
-            "end": 53403682,
+            "start": 87673820,
+            "end": 87681756,
             "audio": false
         },
         {
             "filename": "/Mods/Steamodded/lovely/perma_bonus.toml",
             "crunched": 0,
-            "start": 53403682,
-            "end": 53416842,
+            "start": 87681756,
+            "end": 87694916,
             "audio": false
         },
         {
             "filename": "/Mods/Steamodded/lovely/playing_card.toml",
             "crunched": 0,
-            "start": 53416842,
-            "end": 53428147,
+            "start": 87694916,
+            "end": 87706221,
             "audio": false
         },
         {
             "filename": "/Mods/Steamodded/lovely/poker_hand_screen.toml",
             "crunched": 0,
-            "start": 53428147,
-            "end": 53430248,
+            "start": 87706221,
+            "end": 87708322,
             "audio": false
         },
         {
             "filename": "/Mods/Steamodded/lovely/poker_hand_text.toml",
             "crunched": 0,
-            "start": 53430248,
-            "end": 53431510,
+            "start": 87708322,
+            "end": 87709584,
             "audio": false
         },
         {
             "filename": "/Mods/Steamodded/lovely/poker_hand.toml",
             "crunched": 0,
-            "start": 53431510,
-            "end": 53434839,
+            "start": 87709584,
+            "end": 87712913,
             "audio": false
         },
         {
             "filename": "/Mods/Steamodded/lovely/pool.toml",
             "crunched": 0,
-            "start": 53434839,
-            "end": 53440970,
+            "start": 87712913,
+            "end": 87719044,
             "audio": false
         },
         {
             "filename": "/Mods/Steamodded/lovely/preflight.toml",
             "crunched": 0,
-            "start": 53440970,
-            "end": 53442196,
+            "start": 87719044,
+            "end": 87720270,
             "audio": false
         },
         {
             "filename": "/Mods/Steamodded/lovely/rarity.toml",
             "crunched": 0,
-            "start": 53442196,
-            "end": 53444543,
+            "start": 87720270,
+            "end": 87722617,
             "audio": false
         },
         {
             "filename": "/Mods/Steamodded/lovely/scaling.toml",
             "crunched": 0,
-            "start": 53444543,
-            "end": 53461271,
+            "start": 87722617,
+            "end": 87739345,
             "audio": false
         },
         {
             "filename": "/Mods/Steamodded/lovely/score_mod.toml",
             "crunched": 0,
-            "start": 53461271,
-            "end": 53462774,
+            "start": 87739345,
+            "end": 87740848,
             "audio": false
         },
         {
             "filename": "/Mods/Steamodded/lovely/scoring_calculation.toml",
             "crunched": 0,
-            "start": 53462774,
-            "end": 53474090,
+            "start": 87740848,
+            "end": 87752164,
             "audio": false
         },
         {
             "filename": "/Mods/Steamodded/lovely/screenshader_rendering.toml",
             "crunched": 0,
-            "start": 53474090,
-            "end": 53476409,
+            "start": 87752164,
+            "end": 87754483,
             "audio": false
         },
         {
             "filename": "/Mods/Steamodded/lovely/seal.toml",
             "crunched": 0,
-            "start": 53476409,
-            "end": 53483224,
+            "start": 87754483,
+            "end": 87761298,
             "audio": false
         },
         {
             "filename": "/Mods/Steamodded/lovely/shaders.toml",
             "crunched": 0,
-            "start": 53483224,
-            "end": 53484143,
+            "start": 87761298,
+            "end": 87762217,
             "audio": false
         },
         {
             "filename": "/Mods/Steamodded/lovely/shop.toml",
             "crunched": 0,
-            "start": 53484143,
-            "end": 53491472,
+            "start": 87762217,
+            "end": 87769546,
             "audio": false
         },
         {
             "filename": "/Mods/Steamodded/lovely/sound.toml",
             "crunched": 0,
-            "start": 53491472,
-            "end": 53496632,
+            "start": 87769546,
+            "end": 87774706,
             "audio": false
         },
         {
             "filename": "/Mods/Steamodded/lovely/stake.toml",
             "crunched": 0,
-            "start": 53496632,
-            "end": 53506838,
+            "start": 87774706,
+            "end": 87784912,
             "audio": false
         },
         {
             "filename": "/Mods/Steamodded/lovely/sticker.toml",
             "crunched": 0,
-            "start": 53506838,
-            "end": 53510793,
+            "start": 87784912,
+            "end": 87788867,
             "audio": false
         },
         {
             "filename": "/Mods/Steamodded/lovely/tag.toml",
             "crunched": 0,
-            "start": 53510793,
-            "end": 53515885,
+            "start": 87788867,
+            "end": 87793959,
             "audio": false
         },
         {
             "filename": "/Mods/Steamodded/lovely/text_effect.toml",
             "crunched": 0,
-            "start": 53515885,
-            "end": 53521734,
+            "start": 87793959,
+            "end": 87799808,
             "audio": false
         },
         {
             "filename": "/Mods/Steamodded/lovely/threads.toml",
             "crunched": 0,
-            "start": 53521734,
-            "end": 53522416,
+            "start": 87799808,
+            "end": 87800490,
             "audio": false
         },
         {
             "filename": "/Mods/Steamodded/lovely/ui_additional_text_props.toml",
             "crunched": 0,
-            "start": 53522416,
-            "end": 53532807,
+            "start": 87800490,
+            "end": 87810881,
             "audio": false
         },
         {
             "filename": "/Mods/Steamodded/lovely/ui_elements.toml",
             "crunched": 0,
-            "start": 53532807,
-            "end": 53545062,
+            "start": 87810881,
+            "end": 87823136,
             "audio": false
         },
         {
             "filename": "/Mods/Steamodded/lovely/ui_overflow.toml",
             "crunched": 0,
-            "start": 53545062,
-            "end": 53547616,
+            "start": 87823136,
+            "end": 87825690,
             "audio": false
         },
         {
             "filename": "/Mods/Steamodded/lovely/ui.toml",
             "crunched": 0,
-            "start": 53547616,
-            "end": 53564477,
+            "start": 87825690,
+            "end": 87842551,
             "audio": false
         },
         {
             "filename": "/Mods/Steamodded/lovely/weights.toml",
             "crunched": 0,
-            "start": 53564477,
-            "end": 53567203,
+            "start": 87842551,
+            "end": 87845277,
             "audio": false
         },
         {
             "filename": "/Mods/Steamodded/manifest.json",
             "crunched": 0,
-            "start": 53567203,
-            "end": 53567436,
+            "start": 87845277,
+            "end": 87845510,
             "audio": false
         },
         {
             "filename": "/Mods/Steamodded/README.md",
             "crunched": 0,
-            "start": 53567436,
-            "end": 53569238,
+            "start": 87845510,
+            "end": 87847312,
             "audio": false
         },
         {
             "filename": "/Mods/Steamodded/release.lua",
             "crunched": 0,
-            "start": 53569238,
-            "end": 53569275,
+            "start": 87847312,
+            "end": 87847349,
             "audio": false
         },
         {
             "filename": "/Mods/Steamodded/src/card_draw.lua",
             "crunched": 0,
-            "start": 53569275,
-            "end": 53594042,
+            "start": 87847349,
+            "end": 87872116,
             "audio": false
         },
         {
             "filename": "/Mods/Steamodded/src/compat_0_9_8.lua",
             "crunched": 0,
-            "start": 53594042,
-            "end": 53612112,
+            "start": 87872116,
+            "end": 87890186,
             "audio": false
         },
         {
             "filename": "/Mods/Steamodded/src/core.lua",
             "crunched": 0,
-            "start": 53612112,
-            "end": 53613981,
+            "start": 87890186,
+            "end": 87892055,
             "audio": false
         },
         {
             "filename": "/Mods/Steamodded/src/crash_handler.lua",
             "crunched": 0,
-            "start": 53613981,
-            "end": 53651242,
+            "start": 87892055,
+            "end": 87929316,
             "audio": false
         },
         {
             "filename": "/Mods/Steamodded/src/game_object.lua",
             "crunched": 0,
-            "start": 53651242,
-            "end": 53822623,
+            "start": 87929316,
+            "end": 88100697,
             "audio": false
         },
         {
             "filename": "/Mods/Steamodded/src/game_objects/attributes.lua",
             "crunched": 0,
-            "start": 53822623,
-            "end": 53835036,
+            "start": 88100697,
+            "end": 88113110,
             "audio": false
         },
         {
             "filename": "/Mods/Steamodded/src/index.lua",
             "crunched": 0,
-            "start": 53835036,
-            "end": 53836449,
+            "start": 88113110,
+            "end": 88114523,
             "audio": false
         },
         {
             "filename": "/Mods/Steamodded/src/overrides.lua",
             "crunched": 0,
-            "start": 53836449,
-            "end": 53949465,
+            "start": 88114523,
+            "end": 88227539,
             "audio": false
         },
         {
             "filename": "/Mods/Steamodded/src/preflight/core.lua",
             "crunched": 0,
-            "start": 53949465,
-            "end": 53955049,
+            "start": 88227539,
+            "end": 88233123,
             "audio": false
         },
         {
             "filename": "/Mods/Steamodded/src/preflight/loader.lua",
             "crunched": 0,
-            "start": 53955049,
-            "end": 53994657,
+            "start": 88233123,
+            "end": 88272731,
             "audio": false
         },
         {
             "filename": "/Mods/Steamodded/src/preflight/logging.lua",
             "crunched": 0,
-            "start": 53994657,
-            "end": 53996569,
+            "start": 88272731,
+            "end": 88274643,
             "audio": false
         },
         {
             "filename": "/Mods/Steamodded/src/preflight/main.lua",
             "crunched": 0,
-            "start": 53996569,
-            "end": 53999364,
+            "start": 88274643,
+            "end": 88277438,
             "audio": false
         },
         {
             "filename": "/Mods/Steamodded/src/preflight/sharedUI.lua",
             "crunched": 0,
-            "start": 53999364,
-            "end": 54005290,
+            "start": 88277438,
+            "end": 88283364,
             "audio": false
         },
         {
             "filename": "/Mods/Steamodded/src/preflight/sharedUtil.lua",
             "crunched": 0,
-            "start": 54005290,
-            "end": 54008588,
+            "start": 88283364,
+            "end": 88286662,
             "audio": false
         },
         {
             "filename": "/Mods/Steamodded/src/ui.lua",
             "crunched": 0,
-            "start": 54008588,
-            "end": 54140881,
+            "start": 88286662,
+            "end": 88418955,
             "audio": false
         },
         {
             "filename": "/Mods/Steamodded/src/utils.lua",
             "crunched": 0,
-            "start": 54140881,
-            "end": 54312918,
+            "start": 88418955,
+            "end": 88590992,
             "audio": false
         },
         {
             "filename": "/Mods/Steamodded/src/utils/weights.lua",
             "crunched": 0,
-            "start": 54312918,
-            "end": 54332048,
+            "start": 88590992,
+            "end": 88610122,
             "audio": false
         },
         {
             "filename": "/Mods/Steamodded/tk_debug_window.py",
             "crunched": 0,
-            "start": 54332048,
-            "end": 54357877,
+            "start": 88610122,
+            "end": 88635951,
             "audio": false
         },
         {
             "filename": "/Mods/Steamodded/version.lua",
             "crunched": 0,
-            "start": 54357877,
-            "end": 54357914,
+            "start": 88635951,
+            "end": 88635988,
             "audio": false
         },
         {
             "filename": "/nativefs.lua",
             "crunched": 0,
-            "start": 54357914,
-            "end": 54361136,
-            "audio": false
-        },
-        {
-            "filename": "/resources/fonts/GoNotoCJKCore.ttf",
-            "crunched": 0,
-            "start": 54361136,
-            "end": 72861108,
-            "audio": false
-        },
-        {
-            "filename": "/resources/fonts/GoNotoCurrent-Bold.ttf",
-            "crunched": 0,
-            "start": 72861108,
-            "end": 87395152,
+            "start": 88635988,
+            "end": 88639746,
             "audio": false
         },
         {
             "filename": "/resources/fonts/m6x11plus.ttf",
             "crunched": 0,
-            "start": 87395152,
-            "end": 87430217,
+            "start": 88639746,
+            "end": 88674811,
             "audio": false
         },
         {
             "filename": "/resources/fonts/NotoSans-Bold.ttf",
             "crunched": 0,
-            "start": 87430217,
-            "end": 88012821,
-            "audio": false
-        },
-        {
-            "filename": "/resources/fonts/NotoSansJP-Bold.ttf",
-            "crunched": 0,
-            "start": 88012821,
-            "end": 93740649,
-            "audio": false
-        },
-        {
-            "filename": "/resources/fonts/NotoSansKR-Bold.ttf",
-            "crunched": 0,
-            "start": 93740649,
-            "end": 99931473,
-            "audio": false
-        },
-        {
-            "filename": "/resources/fonts/NotoSansSC-Bold.ttf",
-            "crunched": 0,
-            "start": 99931473,
-            "end": 110481589,
-            "audio": false
-        },
-        {
-            "filename": "/resources/fonts/NotoSansTC-Bold.ttf",
-            "crunched": 0,
-            "start": 110481589,
-            "end": 117586901,
+            "start": 88674811,
+            "end": 89257415,
             "audio": false
         },
         {
             "filename": "/resources/gamecontrollerdb.txt",
             "crunched": 0,
-            "start": 117586901,
-            "end": 117984725,
+            "start": 89257415,
+            "end": 89655239,
             "audio": false
         },
         {
             "filename": "/resources/shaders/background.fs",
             "crunched": 0,
-            "start": 117984725,
-            "end": 117987245,
+            "start": 89655239,
+            "end": 89657759,
             "audio": false
         },
         {
             "filename": "/resources/shaders/booster.fs",
             "crunched": 0,
-            "start": 117987245,
-            "end": 117992568,
+            "start": 89657759,
+            "end": 89663082,
             "audio": false
         },
         {
             "filename": "/resources/shaders/CRT.fs",
             "crunched": 0,
-            "start": 117992568,
-            "end": 117999838,
+            "start": 89663082,
+            "end": 89670352,
             "audio": false
         },
         {
             "filename": "/resources/shaders/debuff.fs",
             "crunched": 0,
-            "start": 117999838,
-            "end": 118005002,
+            "start": 89670352,
+            "end": 89675516,
             "audio": false
         },
         {
             "filename": "/resources/shaders/dissolve.fs",
             "crunched": 0,
-            "start": 118005002,
-            "end": 118009271,
+            "start": 89675516,
+            "end": 89679785,
             "audio": false
         },
         {
             "filename": "/resources/shaders/flame.fs",
             "crunched": 0,
-            "start": 118009271,
-            "end": 118012120,
+            "start": 89679785,
+            "end": 89682634,
             "audio": false
         },
         {
             "filename": "/resources/shaders/flash.fs",
             "crunched": 0,
-            "start": 118012120,
-            "end": 118013021,
+            "start": 89682634,
+            "end": 89683535,
             "audio": false
         },
         {
             "filename": "/resources/shaders/foil.fs",
             "crunched": 0,
-            "start": 118013021,
-            "end": 118018956,
+            "start": 89683535,
+            "end": 89689470,
             "audio": false
         },
         {
             "filename": "/resources/shaders/gold_seal.fs",
             "crunched": 0,
-            "start": 118018956,
-            "end": 118019757,
+            "start": 89689470,
+            "end": 89690271,
             "audio": false
         },
         {
             "filename": "/resources/shaders/holo.fs",
             "crunched": 0,
-            "start": 118019757,
-            "end": 118025764,
+            "start": 89690271,
+            "end": 89696278,
             "audio": false
         },
         {
             "filename": "/resources/shaders/hologram.fs",
             "crunched": 0,
-            "start": 118025764,
-            "end": 118031520,
+            "start": 89696278,
+            "end": 89702034,
             "audio": false
         },
         {
             "filename": "/resources/shaders/negative_shine.fs",
             "crunched": 0,
-            "start": 118031520,
-            "end": 118036430,
+            "start": 89702034,
+            "end": 89706944,
             "audio": false
         },
         {
             "filename": "/resources/shaders/negative.fs",
             "crunched": 0,
-            "start": 118036430,
-            "end": 118041324,
+            "start": 89706944,
+            "end": 89711838,
             "audio": false
         },
         {
             "filename": "/resources/shaders/played.fs",
             "crunched": 0,
-            "start": 118041324,
-            "end": 118046114,
+            "start": 89711838,
+            "end": 89716628,
             "audio": false
         },
         {
             "filename": "/resources/shaders/polychrome.fs",
             "crunched": 0,
-            "start": 118046114,
-            "end": 118051940,
+            "start": 89716628,
+            "end": 89722454,
             "audio": false
         },
         {
             "filename": "/resources/shaders/skew.fs",
             "crunched": 0,
-            "start": 118051940,
-            "end": 118052611,
+            "start": 89722454,
+            "end": 89723125,
             "audio": false
         },
         {
             "filename": "/resources/shaders/splash.fs",
             "crunched": 0,
-            "start": 118052611,
-            "end": 118055218,
+            "start": 89723125,
+            "end": 89725732,
             "audio": false
         },
         {
             "filename": "/resources/shaders/vortex.fs",
             "crunched": 0,
-            "start": 118055218,
-            "end": 118056029,
+            "start": 89725732,
+            "end": 89726543,
             "audio": false
         },
         {
             "filename": "/resources/shaders/voucher.fs",
             "crunched": 0,
-            "start": 118056029,
-            "end": 118060858,
+            "start": 89726543,
+            "end": 89731372,
             "audio": false
         },
         {
             "filename": "/resources/sounds/ambientFire1.ogg",
             "crunched": 0,
-            "start": 118060858,
-            "end": 118539189,
+            "start": 89731372,
+            "end": 90209703,
             "audio": false
         },
         {
             "filename": "/resources/sounds/ambientFire2.ogg",
             "crunched": 0,
-            "start": 118539189,
-            "end": 119047686,
+            "start": 90209703,
+            "end": 90718200,
             "audio": false
         },
         {
             "filename": "/resources/sounds/ambientFire3.ogg",
             "crunched": 0,
-            "start": 119047686,
-            "end": 119551243,
+            "start": 90718200,
+            "end": 91221757,
             "audio": false
         },
         {
             "filename": "/resources/sounds/ambientOrgan1.ogg",
             "crunched": 0,
-            "start": 119551243,
-            "end": 119932196,
+            "start": 91221757,
+            "end": 91602710,
             "audio": false
         },
         {
             "filename": "/resources/sounds/button.ogg",
             "crunched": 0,
-            "start": 119932196,
-            "end": 119940329,
+            "start": 91602710,
+            "end": 91610843,
             "audio": false
         },
         {
             "filename": "/resources/sounds/cancel.ogg",
             "crunched": 0,
-            "start": 119940329,
-            "end": 119950409,
+            "start": 91610843,
+            "end": 91620923,
             "audio": false
         },
         {
             "filename": "/resources/sounds/card1.ogg",
             "crunched": 0,
-            "start": 119950409,
-            "end": 119964347,
+            "start": 91620923,
+            "end": 91634861,
             "audio": false
         },
         {
             "filename": "/resources/sounds/card3.ogg",
             "crunched": 0,
-            "start": 119964347,
-            "end": 119976219,
+            "start": 91634861,
+            "end": 91646733,
             "audio": false
         },
         {
             "filename": "/resources/sounds/cardFan2.ogg",
             "crunched": 0,
-            "start": 119976219,
-            "end": 119992688,
+            "start": 91646733,
+            "end": 91663202,
             "audio": false
         },
         {
             "filename": "/resources/sounds/cardSlide1.ogg",
             "crunched": 0,
-            "start": 119992688,
-            "end": 120003616,
+            "start": 91663202,
+            "end": 91674130,
             "audio": false
         },
         {
             "filename": "/resources/sounds/cardSlide2.ogg",
             "crunched": 0,
-            "start": 120003616,
-            "end": 120013499,
+            "start": 91674130,
+            "end": 91684013,
             "audio": false
         },
         {
             "filename": "/resources/sounds/chips1.ogg",
             "crunched": 0,
-            "start": 120013499,
-            "end": 120022483,
+            "start": 91684013,
+            "end": 91692997,
             "audio": false
         },
         {
             "filename": "/resources/sounds/chips2.ogg",
             "crunched": 0,
-            "start": 120022483,
-            "end": 120034600,
+            "start": 91692997,
+            "end": 91705114,
             "audio": false
         },
         {
             "filename": "/resources/sounds/coin1.ogg",
             "crunched": 0,
-            "start": 120034600,
-            "end": 120045909,
+            "start": 91705114,
+            "end": 91716423,
             "audio": false
         },
         {
             "filename": "/resources/sounds/coin2.ogg",
             "crunched": 0,
-            "start": 120045909,
-            "end": 120055635,
+            "start": 91716423,
+            "end": 91726149,
             "audio": false
         },
         {
             "filename": "/resources/sounds/coin3.ogg",
             "crunched": 0,
-            "start": 120055635,
-            "end": 120067298,
+            "start": 91726149,
+            "end": 91737812,
             "audio": false
         },
         {
             "filename": "/resources/sounds/coin4.ogg",
             "crunched": 0,
-            "start": 120067298,
-            "end": 120077823,
+            "start": 91737812,
+            "end": 91748337,
             "audio": false
         },
         {
             "filename": "/resources/sounds/coin5.ogg",
             "crunched": 0,
-            "start": 120077823,
-            "end": 120090925,
+            "start": 91748337,
+            "end": 91761439,
             "audio": false
         },
         {
             "filename": "/resources/sounds/coin6.ogg",
             "crunched": 0,
-            "start": 120090925,
-            "end": 120108976,
+            "start": 91761439,
+            "end": 91779490,
             "audio": false
         },
         {
             "filename": "/resources/sounds/coin7.ogg",
             "crunched": 0,
-            "start": 120108976,
-            "end": 120120291,
+            "start": 91779490,
+            "end": 91790805,
             "audio": false
         },
         {
             "filename": "/resources/sounds/crumple1.ogg",
             "crunched": 0,
-            "start": 120120291,
-            "end": 120134475,
+            "start": 91790805,
+            "end": 91804989,
             "audio": false
         },
         {
             "filename": "/resources/sounds/crumple2.ogg",
             "crunched": 0,
-            "start": 120134475,
-            "end": 120148811,
+            "start": 91804989,
+            "end": 91819325,
             "audio": false
         },
         {
             "filename": "/resources/sounds/crumple3.ogg",
             "crunched": 0,
-            "start": 120148811,
-            "end": 120162095,
+            "start": 91819325,
+            "end": 91832609,
             "audio": false
         },
         {
             "filename": "/resources/sounds/crumple4.ogg",
             "crunched": 0,
-            "start": 120162095,
-            "end": 120175227,
+            "start": 91832609,
+            "end": 91845741,
             "audio": false
         },
         {
             "filename": "/resources/sounds/crumple5.ogg",
             "crunched": 0,
-            "start": 120175227,
-            "end": 120189033,
+            "start": 91845741,
+            "end": 91859547,
             "audio": false
         },
         {
             "filename": "/resources/sounds/crumpleLong1.ogg",
             "crunched": 0,
-            "start": 120189033,
-            "end": 120240171,
+            "start": 91859547,
+            "end": 91910685,
             "audio": false
         },
         {
             "filename": "/resources/sounds/crumpleLong2.ogg",
             "crunched": 0,
-            "start": 120240171,
-            "end": 120294913,
+            "start": 91910685,
+            "end": 91965427,
             "audio": false
         },
         {
             "filename": "/resources/sounds/explosion_buildup1.ogg",
             "crunched": 0,
-            "start": 120294913,
-            "end": 120326764,
+            "start": 91965427,
+            "end": 91997278,
             "audio": false
         },
         {
             "filename": "/resources/sounds/explosion_release1.ogg",
             "crunched": 0,
-            "start": 120326764,
-            "end": 120358762,
+            "start": 91997278,
+            "end": 92029276,
             "audio": false
         },
         {
             "filename": "/resources/sounds/explosion1.ogg",
             "crunched": 0,
-            "start": 120358762,
-            "end": 120407188,
+            "start": 92029276,
+            "end": 92077702,
             "audio": false
         },
         {
             "filename": "/resources/sounds/foil1.ogg",
             "crunched": 0,
-            "start": 120407188,
-            "end": 120415954,
+            "start": 92077702,
+            "end": 92086468,
             "audio": false
         },
         {
             "filename": "/resources/sounds/foil2.ogg",
             "crunched": 0,
-            "start": 120415954,
-            "end": 120425496,
+            "start": 92086468,
+            "end": 92096010,
             "audio": false
         },
         {
             "filename": "/resources/sounds/generic1.ogg",
             "crunched": 0,
-            "start": 120425496,
-            "end": 120432631,
+            "start": 92096010,
+            "end": 92103145,
             "audio": false
         },
         {
             "filename": "/resources/sounds/glass1.ogg",
             "crunched": 0,
-            "start": 120432631,
-            "end": 120449585,
+            "start": 92103145,
+            "end": 92120099,
             "audio": false
         },
         {
             "filename": "/resources/sounds/glass2.ogg",
             "crunched": 0,
-            "start": 120449585,
-            "end": 120466382,
+            "start": 92120099,
+            "end": 92136896,
             "audio": false
         },
         {
             "filename": "/resources/sounds/glass3.ogg",
             "crunched": 0,
-            "start": 120466382,
-            "end": 120482954,
+            "start": 92136896,
+            "end": 92153468,
             "audio": false
         },
         {
             "filename": "/resources/sounds/glass4.ogg",
             "crunched": 0,
-            "start": 120482954,
-            "end": 120500458,
+            "start": 92153468,
+            "end": 92170972,
             "audio": false
         },
         {
             "filename": "/resources/sounds/glass5.ogg",
             "crunched": 0,
-            "start": 120500458,
-            "end": 120517593,
+            "start": 92170972,
+            "end": 92188107,
             "audio": false
         },
         {
             "filename": "/resources/sounds/glass6.ogg",
             "crunched": 0,
-            "start": 120517593,
-            "end": 120535638,
+            "start": 92188107,
+            "end": 92206152,
             "audio": false
         },
         {
             "filename": "/resources/sounds/gold_seal.ogg",
             "crunched": 0,
-            "start": 120535638,
-            "end": 120548922,
+            "start": 92206152,
+            "end": 92219436,
             "audio": false
         },
         {
             "filename": "/resources/sounds/gong.ogg",
             "crunched": 0,
-            "start": 120548922,
-            "end": 120567067,
+            "start": 92219436,
+            "end": 92237581,
             "audio": false
         },
         {
             "filename": "/resources/sounds/highlight1.ogg",
             "crunched": 0,
-            "start": 120567067,
-            "end": 120574254,
+            "start": 92237581,
+            "end": 92244768,
             "audio": false
         },
         {
             "filename": "/resources/sounds/highlight2.ogg",
             "crunched": 0,
-            "start": 120574254,
-            "end": 120587638,
+            "start": 92244768,
+            "end": 92258152,
             "audio": false
         },
         {
             "filename": "/resources/sounds/holo1.ogg",
             "crunched": 0,
-            "start": 120587638,
-            "end": 120600193,
+            "start": 92258152,
+            "end": 92270707,
             "audio": false
         },
         {
             "filename": "/resources/sounds/introPad1.ogg",
             "crunched": 0,
-            "start": 120600193,
-            "end": 120934211,
+            "start": 92270707,
+            "end": 92604725,
             "audio": false
         },
         {
             "filename": "/resources/sounds/magic_crumple.ogg",
             "crunched": 0,
-            "start": 120934211,
-            "end": 121020340,
+            "start": 92604725,
+            "end": 92690854,
             "audio": false
         },
         {
             "filename": "/resources/sounds/magic_crumple2.ogg",
             "crunched": 0,
-            "start": 121020340,
-            "end": 121055670,
+            "start": 92690854,
+            "end": 92726184,
             "audio": false
         },
         {
             "filename": "/resources/sounds/magic_crumple3.ogg",
             "crunched": 0,
-            "start": 121055670,
-            "end": 121080100,
+            "start": 92726184,
+            "end": 92750614,
             "audio": false
         },
         {
             "filename": "/resources/sounds/multhit1.ogg",
             "crunched": 0,
-            "start": 121080100,
-            "end": 121092182,
+            "start": 92750614,
+            "end": 92762696,
             "audio": false
         },
         {
             "filename": "/resources/sounds/multhit2.ogg",
             "crunched": 0,
-            "start": 121092182,
-            "end": 121107134,
+            "start": 92762696,
+            "end": 92777648,
             "audio": false
         },
         {
             "filename": "/resources/sounds/music1.ogg",
             "crunched": 0,
-            "start": 121107134,
-            "end": 124045876,
+            "start": 92777648,
+            "end": 95716390,
             "audio": false
         },
         {
             "filename": "/resources/sounds/music2.ogg",
             "crunched": 0,
-            "start": 124045876,
-            "end": 126661145,
+            "start": 95716390,
+            "end": 98331659,
             "audio": false
         },
         {
             "filename": "/resources/sounds/music3.ogg",
             "crunched": 0,
-            "start": 126661145,
-            "end": 129172203,
+            "start": 98331659,
+            "end": 100842717,
             "audio": false
         },
         {
             "filename": "/resources/sounds/music4.ogg",
             "crunched": 0,
-            "start": 129172203,
-            "end": 131980600,
+            "start": 100842717,
+            "end": 103651114,
             "audio": false
         },
         {
             "filename": "/resources/sounds/music5.ogg",
             "crunched": 0,
-            "start": 131980600,
-            "end": 134826428,
+            "start": 103651114,
+            "end": 106496942,
             "audio": false
         },
         {
             "filename": "/resources/sounds/negative.ogg",
             "crunched": 0,
-            "start": 134826428,
-            "end": 134839626,
+            "start": 106496942,
+            "end": 106510140,
             "audio": false
         },
         {
             "filename": "/resources/sounds/other1.ogg",
             "crunched": 0,
-            "start": 134839626,
-            "end": 134851774,
+            "start": 106510140,
+            "end": 106522288,
             "audio": false
         },
         {
             "filename": "/resources/sounds/paper1.ogg",
             "crunched": 0,
-            "start": 134851774,
-            "end": 134857046,
+            "start": 106522288,
+            "end": 106527560,
             "audio": false
         },
         {
             "filename": "/resources/sounds/polychrome1.ogg",
             "crunched": 0,
-            "start": 134857046,
-            "end": 134887067,
+            "start": 106527560,
+            "end": 106557581,
             "audio": false
         },
         {
             "filename": "/resources/sounds/slice1.ogg",
             "crunched": 0,
-            "start": 134887067,
-            "end": 134895564,
+            "start": 106557581,
+            "end": 106566078,
             "audio": false
         },
         {
             "filename": "/resources/sounds/splash_buildup.ogg",
             "crunched": 0,
-            "start": 134895564,
-            "end": 135235123,
+            "start": 106566078,
+            "end": 106905637,
             "audio": false
         },
         {
             "filename": "/resources/sounds/tarot1.ogg",
             "crunched": 0,
-            "start": 135235123,
-            "end": 135244244,
+            "start": 106905637,
+            "end": 106914758,
             "audio": false
         },
         {
             "filename": "/resources/sounds/tarot2.ogg",
             "crunched": 0,
-            "start": 135244244,
-            "end": 135255066,
+            "start": 106914758,
+            "end": 106925580,
             "audio": false
         },
         {
             "filename": "/resources/sounds/timpani.ogg",
             "crunched": 0,
-            "start": 135255066,
-            "end": 135269257,
+            "start": 106925580,
+            "end": 106939771,
             "audio": false
         },
         {
             "filename": "/resources/sounds/voice1.ogg",
             "crunched": 0,
-            "start": 135269257,
-            "end": 135276341,
+            "start": 106939771,
+            "end": 106946855,
             "audio": false
         },
         {
             "filename": "/resources/sounds/voice10.ogg",
             "crunched": 0,
-            "start": 135276341,
-            "end": 135283432,
+            "start": 106946855,
+            "end": 106953946,
             "audio": false
         },
         {
             "filename": "/resources/sounds/voice11.ogg",
             "crunched": 0,
-            "start": 135283432,
-            "end": 135290421,
+            "start": 106953946,
+            "end": 106960935,
             "audio": false
         },
         {
             "filename": "/resources/sounds/voice2.ogg",
             "crunched": 0,
-            "start": 135290421,
-            "end": 135297441,
+            "start": 106960935,
+            "end": 106967955,
             "audio": false
         },
         {
             "filename": "/resources/sounds/voice3.ogg",
             "crunched": 0,
-            "start": 135297441,
-            "end": 135304540,
+            "start": 106967955,
+            "end": 106975054,
             "audio": false
         },
         {
             "filename": "/resources/sounds/voice4.ogg",
             "crunched": 0,
-            "start": 135304540,
-            "end": 135311903,
+            "start": 106975054,
+            "end": 106982417,
             "audio": false
         },
         {
             "filename": "/resources/sounds/voice5.ogg",
             "crunched": 0,
-            "start": 135311903,
-            "end": 135319098,
+            "start": 106982417,
+            "end": 106989612,
             "audio": false
         },
         {
             "filename": "/resources/sounds/voice6.ogg",
             "crunched": 0,
-            "start": 135319098,
-            "end": 135326217,
+            "start": 106989612,
+            "end": 106996731,
             "audio": false
         },
         {
             "filename": "/resources/sounds/voice7.ogg",
             "crunched": 0,
-            "start": 135326217,
-            "end": 135333278,
+            "start": 106996731,
+            "end": 107003792,
             "audio": false
         },
         {
             "filename": "/resources/sounds/voice8.ogg",
             "crunched": 0,
-            "start": 135333278,
-            "end": 135340442,
+            "start": 107003792,
+            "end": 107010956,
             "audio": false
         },
         {
             "filename": "/resources/sounds/voice9.ogg",
             "crunched": 0,
-            "start": 135340442,
-            "end": 135347608,
+            "start": 107010956,
+            "end": 107018122,
             "audio": false
         },
         {
             "filename": "/resources/sounds/whoosh_long.ogg",
             "crunched": 0,
-            "start": 135347608,
-            "end": 135461789,
+            "start": 107018122,
+            "end": 107132303,
             "audio": false
         },
         {
             "filename": "/resources/sounds/whoosh.ogg",
             "crunched": 0,
-            "start": 135461789,
-            "end": 135471701,
+            "start": 107132303,
+            "end": 107142215,
             "audio": false
         },
         {
             "filename": "/resources/sounds/whoosh1.ogg",
             "crunched": 0,
-            "start": 135471701,
-            "end": 135484603,
+            "start": 107142215,
+            "end": 107155117,
             "audio": false
         },
         {
             "filename": "/resources/sounds/whoosh2.ogg",
             "crunched": 0,
-            "start": 135484603,
-            "end": 135497451,
+            "start": 107155117,
+            "end": 107167965,
             "audio": false
         },
         {
             "filename": "/resources/sounds/win.ogg",
             "crunched": 0,
-            "start": 135497451,
-            "end": 135534017,
+            "start": 107167965,
+            "end": 107204531,
             "audio": false
         },
         {
             "filename": "/resources/textures/1x/8BitDeck_opt2.png",
             "crunched": 0,
-            "start": 135534017,
-            "end": 135596154,
+            "start": 107204531,
+            "end": 107266668,
             "audio": false
         },
         {
             "filename": "/resources/textures/1x/8BitDeck.png",
             "crunched": 0,
-            "start": 135596154,
-            "end": 135643032,
+            "start": 107266668,
+            "end": 107313546,
             "audio": false
         },
         {
             "filename": "/resources/textures/1x/balatro_alt.png",
             "crunched": 0,
-            "start": 135643032,
-            "end": 135663858,
+            "start": 107313546,
+            "end": 107334372,
             "audio": false
         },
         {
             "filename": "/resources/textures/1x/balatro.png",
             "crunched": 0,
-            "start": 135663858,
-            "end": 135690735,
+            "start": 107334372,
+            "end": 107361249,
             "audio": false
         },
         {
             "filename": "/resources/textures/1x/BlindChips.png",
             "crunched": 0,
-            "start": 135690735,
-            "end": 135774547,
+            "start": 107361249,
+            "end": 107445061,
             "audio": false
         },
         {
             "filename": "/resources/textures/1x/boosters.png",
             "crunched": 0,
-            "start": 135774547,
-            "end": 135945165,
+            "start": 107445061,
+            "end": 107615679,
             "audio": false
         },
         {
             "filename": "/resources/textures/1x/chips.png",
             "crunched": 0,
-            "start": 135945165,
-            "end": 135953420,
+            "start": 107615679,
+            "end": 107623934,
             "audio": false
         },
         {
             "filename": "/resources/textures/1x/collabs/collab_AC_1.png",
             "crunched": 0,
-            "start": 135953420,
-            "end": 135961799,
+            "start": 107623934,
+            "end": 107632313,
             "audio": false
         },
         {
             "filename": "/resources/textures/1x/collabs/collab_AC_2.png",
             "crunched": 0,
-            "start": 135961799,
-            "end": 135970114,
+            "start": 107632313,
+            "end": 107640628,
             "audio": false
         },
         {
             "filename": "/resources/textures/1x/collabs/collab_AU_1.png",
             "crunched": 0,
-            "start": 135970114,
-            "end": 135975146,
+            "start": 107640628,
+            "end": 107645660,
             "audio": false
         },
         {
             "filename": "/resources/textures/1x/collabs/collab_AU_2.png",
             "crunched": 0,
-            "start": 135975146,
-            "end": 135982450,
+            "start": 107645660,
+            "end": 107652964,
             "audio": false
         },
         {
             "filename": "/resources/textures/1x/collabs/collab_BUG_1.png",
             "crunched": 0,
-            "start": 135982450,
-            "end": 135993602,
+            "start": 107652964,
+            "end": 107664116,
             "audio": false
         },
         {
             "filename": "/resources/textures/1x/collabs/collab_BUG_2.png",
             "crunched": 0,
-            "start": 135993602,
-            "end": 136006322,
+            "start": 107664116,
+            "end": 107676836,
             "audio": false
         },
         {
             "filename": "/resources/textures/1x/collabs/collab_C7_1.png",
             "crunched": 0,
-            "start": 136006322,
-            "end": 136016125,
+            "start": 107676836,
+            "end": 107686639,
             "audio": false
         },
         {
             "filename": "/resources/textures/1x/collabs/collab_C7_2.png",
             "crunched": 0,
-            "start": 136016125,
-            "end": 136025804,
+            "start": 107686639,
+            "end": 107696318,
             "audio": false
         },
         {
             "filename": "/resources/textures/1x/collabs/collab_CL_1.png",
             "crunched": 0,
-            "start": 136025804,
-            "end": 136032287,
+            "start": 107696318,
+            "end": 107702801,
             "audio": false
         },
         {
             "filename": "/resources/textures/1x/collabs/collab_CL_2.png",
             "crunched": 0,
-            "start": 136032287,
-            "end": 136040549,
+            "start": 107702801,
+            "end": 107711063,
             "audio": false
         },
         {
             "filename": "/resources/textures/1x/collabs/collab_CR_1.png",
             "crunched": 0,
-            "start": 136040549,
-            "end": 136048716,
+            "start": 107711063,
+            "end": 107719230,
             "audio": false
         },
         {
             "filename": "/resources/textures/1x/collabs/collab_CR_2.png",
             "crunched": 0,
-            "start": 136048716,
-            "end": 136057717,
+            "start": 107719230,
+            "end": 107728231,
             "audio": false
         },
         {
             "filename": "/resources/textures/1x/collabs/collab_CYP_1.png",
             "crunched": 0,
-            "start": 136057717,
-            "end": 136064981,
+            "start": 107728231,
+            "end": 107735495,
             "audio": false
         },
         {
             "filename": "/resources/textures/1x/collabs/collab_CYP_2.png",
             "crunched": 0,
-            "start": 136064981,
-            "end": 136072303,
+            "start": 107735495,
+            "end": 107742817,
             "audio": false
         },
         {
             "filename": "/resources/textures/1x/collabs/collab_D2_1.png",
             "crunched": 0,
-            "start": 136072303,
-            "end": 136080017,
+            "start": 107742817,
+            "end": 107750531,
             "audio": false
         },
         {
             "filename": "/resources/textures/1x/collabs/collab_D2_2.png",
             "crunched": 0,
-            "start": 136080017,
-            "end": 136088858,
+            "start": 107750531,
+            "end": 107759372,
             "audio": false
         },
         {
             "filename": "/resources/textures/1x/collabs/collab_DBD_1.png",
             "crunched": 0,
-            "start": 136088858,
-            "end": 136097545,
+            "start": 107759372,
+            "end": 107768059,
             "audio": false
         },
         {
             "filename": "/resources/textures/1x/collabs/collab_DBD_2.png",
             "crunched": 0,
-            "start": 136097545,
-            "end": 136106634,
+            "start": 107768059,
+            "end": 107777148,
             "audio": false
         },
         {
             "filename": "/resources/textures/1x/collabs/collab_DS_1.png",
             "crunched": 0,
-            "start": 136106634,
-            "end": 136114432,
+            "start": 107777148,
+            "end": 107784946,
             "audio": false
         },
         {
             "filename": "/resources/textures/1x/collabs/collab_DS_2.png",
             "crunched": 0,
-            "start": 136114432,
-            "end": 136122163,
+            "start": 107784946,
+            "end": 107792677,
             "audio": false
         },
         {
             "filename": "/resources/textures/1x/collabs/collab_DTD_1.png",
             "crunched": 0,
-            "start": 136122163,
-            "end": 136129597,
+            "start": 107792677,
+            "end": 107800111,
             "audio": false
         },
         {
             "filename": "/resources/textures/1x/collabs/collab_DTD_2.png",
             "crunched": 0,
-            "start": 136129597,
-            "end": 136135559,
+            "start": 107800111,
+            "end": 107806073,
             "audio": false
         },
         {
             "filename": "/resources/textures/1x/collabs/collab_EG_1.png",
             "crunched": 0,
-            "start": 136135559,
-            "end": 136140292,
+            "start": 107806073,
+            "end": 107810806,
             "audio": false
         },
         {
             "filename": "/resources/textures/1x/collabs/collab_EG_2.png",
             "crunched": 0,
-            "start": 136140292,
-            "end": 136145491,
+            "start": 107810806,
+            "end": 107816005,
             "audio": false
         },
         {
             "filename": "/resources/textures/1x/collabs/collab_FO_1.png",
             "crunched": 0,
-            "start": 136145491,
-            "end": 136154736,
+            "start": 107816005,
+            "end": 107825250,
             "audio": false
         },
         {
             "filename": "/resources/textures/1x/collabs/collab_FO_2.png",
             "crunched": 0,
-            "start": 136154736,
-            "end": 136164294,
+            "start": 107825250,
+            "end": 107834808,
             "audio": false
         },
         {
             "filename": "/resources/textures/1x/collabs/collab_PC_1.png",
             "crunched": 0,
-            "start": 136164294,
-            "end": 136171964,
+            "start": 107834808,
+            "end": 107842478,
             "audio": false
         },
         {
             "filename": "/resources/textures/1x/collabs/collab_PC_2.png",
             "crunched": 0,
-            "start": 136171964,
-            "end": 136179461,
+            "start": 107842478,
+            "end": 107849975,
             "audio": false
         },
         {
             "filename": "/resources/textures/1x/collabs/collab_R_1.png",
             "crunched": 0,
-            "start": 136179461,
-            "end": 136191169,
+            "start": 107849975,
+            "end": 107861683,
             "audio": false
         },
         {
             "filename": "/resources/textures/1x/collabs/collab_R_2.png",
             "crunched": 0,
-            "start": 136191169,
-            "end": 136203970,
+            "start": 107861683,
+            "end": 107874484,
             "audio": false
         },
         {
             "filename": "/resources/textures/1x/collabs/collab_SK_1.png",
             "crunched": 0,
-            "start": 136203970,
-            "end": 136215854,
+            "start": 107874484,
+            "end": 107886368,
             "audio": false
         },
         {
             "filename": "/resources/textures/1x/collabs/collab_SK_2.png",
             "crunched": 0,
-            "start": 136215854,
-            "end": 136227495,
+            "start": 107886368,
+            "end": 107898009,
             "audio": false
         },
         {
             "filename": "/resources/textures/1x/collabs/collab_STP_1.png",
             "crunched": 0,
-            "start": 136227495,
-            "end": 136235933,
+            "start": 107898009,
+            "end": 107906447,
             "audio": false
         },
         {
             "filename": "/resources/textures/1x/collabs/collab_STP_2.png",
             "crunched": 0,
-            "start": 136235933,
-            "end": 136244358,
+            "start": 107906447,
+            "end": 107914872,
             "audio": false
         },
         {
             "filename": "/resources/textures/1x/collabs/collab_STS_1.png",
             "crunched": 0,
-            "start": 136244358,
-            "end": 136253519,
+            "start": 107914872,
+            "end": 107924033,
             "audio": false
         },
         {
             "filename": "/resources/textures/1x/collabs/collab_STS_2.png",
             "crunched": 0,
-            "start": 136253519,
-            "end": 136263618,
+            "start": 107924033,
+            "end": 107934132,
             "audio": false
         },
         {
             "filename": "/resources/textures/1x/collabs/collab_SV_1.png",
             "crunched": 0,
-            "start": 136263618,
-            "end": 136271496,
+            "start": 107934132,
+            "end": 107942010,
             "audio": false
         },
         {
             "filename": "/resources/textures/1x/collabs/collab_SV_2.png",
             "crunched": 0,
-            "start": 136271496,
-            "end": 136280078,
+            "start": 107942010,
+            "end": 107950592,
             "audio": false
         },
         {
             "filename": "/resources/textures/1x/collabs/collab_TBoI_1.png",
             "crunched": 0,
-            "start": 136280078,
-            "end": 136287515,
+            "start": 107950592,
+            "end": 107958029,
             "audio": false
         },
         {
             "filename": "/resources/textures/1x/collabs/collab_TBoI_2.png",
             "crunched": 0,
-            "start": 136287515,
-            "end": 136294987,
+            "start": 107958029,
+            "end": 107965501,
             "audio": false
         },
         {
             "filename": "/resources/textures/1x/collabs/collab_TW_1.png",
             "crunched": 0,
-            "start": 136294987,
-            "end": 136302554,
+            "start": 107965501,
+            "end": 107973068,
             "audio": false
         },
         {
             "filename": "/resources/textures/1x/collabs/collab_TW_2.png",
             "crunched": 0,
-            "start": 136302554,
-            "end": 136309901,
+            "start": 107973068,
+            "end": 107980415,
             "audio": false
         },
         {
             "filename": "/resources/textures/1x/collabs/collab_VS_1.png",
             "crunched": 0,
-            "start": 136309901,
-            "end": 136314893,
+            "start": 107980415,
+            "end": 107985407,
             "audio": false
         },
         {
             "filename": "/resources/textures/1x/collabs/collab_VS_2.png",
             "crunched": 0,
-            "start": 136314893,
-            "end": 136322699,
+            "start": 107985407,
+            "end": 107993213,
             "audio": false
         },
         {
             "filename": "/resources/textures/1x/collabs/collab_WF_1.png",
             "crunched": 0,
-            "start": 136322699,
-            "end": 136329329,
+            "start": 107993213,
+            "end": 107999843,
             "audio": false
         },
         {
             "filename": "/resources/textures/1x/collabs/collab_WF_2.png",
             "crunched": 0,
-            "start": 136329329,
-            "end": 136336758,
+            "start": 107999843,
+            "end": 108007272,
             "audio": false
         },
         {
             "filename": "/resources/textures/1x/collabs/collab_XR_1.png",
             "crunched": 0,
-            "start": 136336758,
-            "end": 136348904,
+            "start": 108007272,
+            "end": 108019418,
             "audio": false
         },
         {
             "filename": "/resources/textures/1x/collabs/collab_XR_2.png",
             "crunched": 0,
-            "start": 136348904,
-            "end": 136359524,
+            "start": 108019418,
+            "end": 108030038,
             "audio": false
         },
         {
             "filename": "/resources/textures/1x/Enhancers.png",
             "crunched": 0,
-            "start": 136359524,
-            "end": 136435476,
+            "start": 108030038,
+            "end": 108105990,
             "audio": false
         },
         {
             "filename": "/resources/textures/1x/gamepad_ui.png",
             "crunched": 0,
-            "start": 136435476,
-            "end": 136455403,
+            "start": 108105990,
+            "end": 108125917,
             "audio": false
         },
         {
             "filename": "/resources/textures/1x/icons.png",
             "crunched": 0,
-            "start": 136455403,
-            "end": 136463959,
+            "start": 108125917,
+            "end": 108134473,
             "audio": false
         },
         {
             "filename": "/resources/textures/1x/Jokers.png",
             "crunched": 0,
-            "start": 136463959,
-            "end": 136968646,
+            "start": 108134473,
+            "end": 108639160,
             "audio": false
         },
         {
             "filename": "/resources/textures/1x/localthunk-logo.png",
             "crunched": 0,
-            "start": 136968646,
-            "end": 136978273,
+            "start": 108639160,
+            "end": 108648787,
             "audio": false
         },
         {
             "filename": "/resources/textures/1x/playstack-logo.png",
             "crunched": 0,
-            "start": 136978273,
-            "end": 137050999,
+            "start": 108648787,
+            "end": 108721513,
             "audio": false
         },
         {
             "filename": "/resources/textures/1x/ShopSignAnimation.png",
             "crunched": 0,
-            "start": 137050999,
-            "end": 137061797,
+            "start": 108721513,
+            "end": 108732311,
             "audio": false
         },
         {
             "filename": "/resources/textures/1x/stickers.png",
             "crunched": 0,
-            "start": 137061797,
-            "end": 137066181,
+            "start": 108732311,
+            "end": 108736695,
             "audio": false
         },
         {
             "filename": "/resources/textures/1x/tags.png",
             "crunched": 0,
-            "start": 137066181,
-            "end": 137073516,
+            "start": 108736695,
+            "end": 108744030,
             "audio": false
         },
         {
             "filename": "/resources/textures/1x/Tarots.png",
             "crunched": 0,
-            "start": 137073516,
-            "end": 137169847,
+            "start": 108744030,
+            "end": 108840361,
             "audio": false
         },
         {
             "filename": "/resources/textures/1x/ui_assets_opt2.png",
             "crunched": 0,
-            "start": 137169847,
-            "end": 137171299,
+            "start": 108840361,
+            "end": 108841813,
             "audio": false
         },
         {
             "filename": "/resources/textures/1x/ui_assets.png",
             "crunched": 0,
-            "start": 137171299,
-            "end": 137172767,
+            "start": 108841813,
+            "end": 108843281,
             "audio": false
         },
         {
             "filename": "/resources/textures/1x/Vouchers.png",
             "crunched": 0,
-            "start": 137172767,
-            "end": 137243476,
+            "start": 108843281,
+            "end": 108913990,
             "audio": false
         },
         {
             "filename": "/resources/textures/2x/8BitDeck_opt2.png",
             "crunched": 0,
-            "start": 137243476,
-            "end": 137324046,
+            "start": 108913990,
+            "end": 108994560,
             "audio": false
         },
         {
             "filename": "/resources/textures/2x/8BitDeck.png",
             "crunched": 0,
-            "start": 137324046,
-            "end": 137388444,
+            "start": 108994560,
+            "end": 109058958,
             "audio": false
         },
         {
             "filename": "/resources/textures/2x/balatro_alt.png",
             "crunched": 0,
-            "start": 137388444,
-            "end": 137415512,
+            "start": 109058958,
+            "end": 109086026,
             "audio": false
         },
         {
             "filename": "/resources/textures/2x/balatro.png",
             "crunched": 0,
-            "start": 137415512,
-            "end": 137450846,
+            "start": 109086026,
+            "end": 109121360,
             "audio": false
         },
         {
             "filename": "/resources/textures/2x/BlindChips.png",
             "crunched": 0,
-            "start": 137450846,
-            "end": 137585352,
+            "start": 109121360,
+            "end": 109255866,
             "audio": false
         },
         {
             "filename": "/resources/textures/2x/boosters.png",
             "crunched": 0,
-            "start": 137585352,
-            "end": 137797015,
+            "start": 109255866,
+            "end": 109467529,
             "audio": false
         },
         {
             "filename": "/resources/textures/2x/chips.png",
             "crunched": 0,
-            "start": 137797015,
-            "end": 137806897,
+            "start": 109467529,
+            "end": 109477411,
             "audio": false
         },
         {
             "filename": "/resources/textures/2x/collabs/collab_AC_1.png",
             "crunched": 0,
-            "start": 137806897,
-            "end": 137816802,
+            "start": 109477411,
+            "end": 109487316,
             "audio": false
         },
         {
             "filename": "/resources/textures/2x/collabs/collab_AC_2.png",
             "crunched": 0,
-            "start": 137816802,
-            "end": 137826670,
+            "start": 109487316,
+            "end": 109497184,
             "audio": false
         },
         {
             "filename": "/resources/textures/2x/collabs/collab_AU_1.png",
             "crunched": 0,
-            "start": 137826670,
-            "end": 137834644,
+            "start": 109497184,
+            "end": 109505158,
             "audio": false
         },
         {
             "filename": "/resources/textures/2x/collabs/collab_AU_2.png",
             "crunched": 0,
-            "start": 137834644,
-            "end": 137844939,
+            "start": 109505158,
+            "end": 109515453,
             "audio": false
         },
         {
             "filename": "/resources/textures/2x/collabs/collab_BUG_1.png",
             "crunched": 0,
-            "start": 137844939,
-            "end": 137858337,
+            "start": 109515453,
+            "end": 109528851,
             "audio": false
         },
         {
             "filename": "/resources/textures/2x/collabs/collab_BUG_2.png",
             "crunched": 0,
-            "start": 137858337,
-            "end": 137873067,
+            "start": 109528851,
+            "end": 109543581,
             "audio": false
         },
         {
             "filename": "/resources/textures/2x/collabs/collab_C7_1.png",
             "crunched": 0,
-            "start": 137873067,
-            "end": 137884787,
+            "start": 109543581,
+            "end": 109555301,
             "audio": false
         },
         {
             "filename": "/resources/textures/2x/collabs/collab_C7_2.png",
             "crunched": 0,
-            "start": 137884787,
-            "end": 137896519,
+            "start": 109555301,
+            "end": 109567033,
             "audio": false
         },
         {
             "filename": "/resources/textures/2x/collabs/collab_CL_1.png",
             "crunched": 0,
-            "start": 137896519,
-            "end": 137907012,
+            "start": 109567033,
+            "end": 109577526,
             "audio": false
         },
         {
             "filename": "/resources/textures/2x/collabs/collab_CL_2.png",
             "crunched": 0,
-            "start": 137907012,
-            "end": 137916778,
+            "start": 109577526,
+            "end": 109587292,
             "audio": false
         },
         {
             "filename": "/resources/textures/2x/collabs/collab_CR_1.png",
             "crunched": 0,
-            "start": 137916778,
-            "end": 137926629,
+            "start": 109587292,
+            "end": 109597143,
             "audio": false
         },
         {
             "filename": "/resources/textures/2x/collabs/collab_CR_2.png",
             "crunched": 0,
-            "start": 137926629,
-            "end": 137937369,
+            "start": 109597143,
+            "end": 109607883,
             "audio": false
         },
         {
             "filename": "/resources/textures/2x/collabs/collab_CYP_1.png",
             "crunched": 0,
-            "start": 137937369,
-            "end": 137948861,
+            "start": 109607883,
+            "end": 109619375,
             "audio": false
         },
         {
             "filename": "/resources/textures/2x/collabs/collab_CYP_2.png",
             "crunched": 0,
-            "start": 137948861,
-            "end": 137960427,
+            "start": 109619375,
+            "end": 109630941,
             "audio": false
         },
         {
             "filename": "/resources/textures/2x/collabs/collab_D2_1.png",
             "crunched": 0,
-            "start": 137960427,
-            "end": 137970933,
+            "start": 109630941,
+            "end": 109641447,
             "audio": false
         },
         {
             "filename": "/resources/textures/2x/collabs/collab_D2_2.png",
             "crunched": 0,
-            "start": 137970933,
-            "end": 137981502,
+            "start": 109641447,
+            "end": 109652016,
             "audio": false
         },
         {
             "filename": "/resources/textures/2x/collabs/collab_DBD_1.png",
             "crunched": 0,
-            "start": 137981502,
-            "end": 137991680,
+            "start": 109652016,
+            "end": 109662194,
             "audio": false
         },
         {
             "filename": "/resources/textures/2x/collabs/collab_DBD_2.png",
             "crunched": 0,
-            "start": 137991680,
-            "end": 138002424,
+            "start": 109662194,
+            "end": 109672938,
             "audio": false
         },
         {
             "filename": "/resources/textures/2x/collabs/collab_DS_1.png",
             "crunched": 0,
-            "start": 138002424,
-            "end": 138012048,
+            "start": 109672938,
+            "end": 109682562,
             "audio": false
         },
         {
             "filename": "/resources/textures/2x/collabs/collab_DS_2.png",
             "crunched": 0,
-            "start": 138012048,
-            "end": 138021633,
+            "start": 109682562,
+            "end": 109692147,
             "audio": false
         },
         {
             "filename": "/resources/textures/2x/collabs/collab_DTD_1.png",
             "crunched": 0,
-            "start": 138021633,
-            "end": 138031199,
+            "start": 109692147,
+            "end": 109701713,
             "audio": false
         },
         {
             "filename": "/resources/textures/2x/collabs/collab_DTD_2.png",
             "crunched": 0,
-            "start": 138031199,
-            "end": 138038616,
+            "start": 109701713,
+            "end": 109709130,
             "audio": false
         },
         {
             "filename": "/resources/textures/2x/collabs/collab_EG_1.png",
             "crunched": 0,
-            "start": 138038616,
-            "end": 138044457,
+            "start": 109709130,
+            "end": 109714971,
             "audio": false
         },
         {
             "filename": "/resources/textures/2x/collabs/collab_EG_2.png",
             "crunched": 0,
-            "start": 138044457,
-            "end": 138050855,
+            "start": 109714971,
+            "end": 109721369,
             "audio": false
         },
         {
             "filename": "/resources/textures/2x/collabs/collab_FO_1.png",
             "crunched": 0,
-            "start": 138050855,
-            "end": 138061777,
+            "start": 109721369,
+            "end": 109732291,
             "audio": false
         },
         {
             "filename": "/resources/textures/2x/collabs/collab_FO_2.png",
             "crunched": 0,
-            "start": 138061777,
-            "end": 138073058,
+            "start": 109732291,
+            "end": 109743572,
             "audio": false
         },
         {
             "filename": "/resources/textures/2x/collabs/collab_PC_1.png",
             "crunched": 0,
-            "start": 138073058,
-            "end": 138082145,
+            "start": 109743572,
+            "end": 109752659,
             "audio": false
         },
         {
             "filename": "/resources/textures/2x/collabs/collab_PC_2.png",
             "crunched": 0,
-            "start": 138082145,
-            "end": 138091180,
+            "start": 109752659,
+            "end": 109761694,
             "audio": false
         },
         {
             "filename": "/resources/textures/2x/collabs/collab_R_1.png",
             "crunched": 0,
-            "start": 138091180,
-            "end": 138104994,
+            "start": 109761694,
+            "end": 109775508,
             "audio": false
         },
         {
             "filename": "/resources/textures/2x/collabs/collab_R_2.png",
             "crunched": 0,
-            "start": 138104994,
-            "end": 138120052,
+            "start": 109775508,
+            "end": 109790566,
             "audio": false
         },
         {
             "filename": "/resources/textures/2x/collabs/collab_SK_1.png",
             "crunched": 0,
-            "start": 138120052,
-            "end": 138133776,
+            "start": 109790566,
+            "end": 109804290,
             "audio": false
         },
         {
             "filename": "/resources/textures/2x/collabs/collab_SK_2.png",
             "crunched": 0,
-            "start": 138133776,
-            "end": 138147165,
+            "start": 109804290,
+            "end": 109817679,
             "audio": false
         },
         {
             "filename": "/resources/textures/2x/collabs/collab_STP_1.png",
             "crunched": 0,
-            "start": 138147165,
-            "end": 138157207,
+            "start": 109817679,
+            "end": 109827721,
             "audio": false
         },
         {
             "filename": "/resources/textures/2x/collabs/collab_STP_2.png",
             "crunched": 0,
-            "start": 138157207,
-            "end": 138167205,
+            "start": 109827721,
+            "end": 109837719,
             "audio": false
         },
         {
             "filename": "/resources/textures/2x/collabs/collab_STS_1.png",
             "crunched": 0,
-            "start": 138167205,
-            "end": 138178264,
+            "start": 109837719,
+            "end": 109848778,
             "audio": false
         },
         {
             "filename": "/resources/textures/2x/collabs/collab_STS_2.png",
             "crunched": 0,
-            "start": 138178264,
-            "end": 138190418,
+            "start": 109848778,
+            "end": 109860932,
             "audio": false
         },
         {
             "filename": "/resources/textures/2x/collabs/collab_SV_1.png",
             "crunched": 0,
-            "start": 138190418,
-            "end": 138202031,
+            "start": 109860932,
+            "end": 109872545,
             "audio": false
         },
         {
             "filename": "/resources/textures/2x/collabs/collab_SV_2.png",
             "crunched": 0,
-            "start": 138202031,
-            "end": 138214628,
+            "start": 109872545,
+            "end": 109885142,
             "audio": false
         },
         {
             "filename": "/resources/textures/2x/collabs/collab_TBoI_1.png",
             "crunched": 0,
-            "start": 138214628,
-            "end": 138225352,
+            "start": 109885142,
+            "end": 109895866,
             "audio": false
         },
         {
             "filename": "/resources/textures/2x/collabs/collab_TBoI_2.png",
             "crunched": 0,
-            "start": 138225352,
-            "end": 138236075,
+            "start": 109895866,
+            "end": 109906589,
             "audio": false
         },
         {
             "filename": "/resources/textures/2x/collabs/collab_TW_1.png",
             "crunched": 0,
-            "start": 138236075,
-            "end": 138247302,
+            "start": 109906589,
+            "end": 109917816,
             "audio": false
         },
         {
             "filename": "/resources/textures/2x/collabs/collab_TW_2.png",
             "crunched": 0,
-            "start": 138247302,
-            "end": 138258228,
+            "start": 109917816,
+            "end": 109928742,
             "audio": false
         },
         {
             "filename": "/resources/textures/2x/collabs/collab_VS_1.png",
             "crunched": 0,
-            "start": 138258228,
-            "end": 138265647,
+            "start": 109928742,
+            "end": 109936161,
             "audio": false
         },
         {
             "filename": "/resources/textures/2x/collabs/collab_VS_2.png",
             "crunched": 0,
-            "start": 138265647,
-            "end": 138274913,
+            "start": 109936161,
+            "end": 109945427,
             "audio": false
         },
         {
             "filename": "/resources/textures/2x/collabs/collab_WF_1.png",
             "crunched": 0,
-            "start": 138274913,
-            "end": 138286196,
+            "start": 109945427,
+            "end": 109956710,
             "audio": false
         },
         {
             "filename": "/resources/textures/2x/collabs/collab_WF_2.png",
             "crunched": 0,
-            "start": 138286196,
-            "end": 138298958,
+            "start": 109956710,
+            "end": 109969472,
             "audio": false
         },
         {
             "filename": "/resources/textures/2x/collabs/collab_XR_1.png",
             "crunched": 0,
-            "start": 138298958,
-            "end": 138313187,
+            "start": 109969472,
+            "end": 109983701,
             "audio": false
         },
         {
             "filename": "/resources/textures/2x/collabs/collab_XR_2.png",
             "crunched": 0,
-            "start": 138313187,
-            "end": 138326079,
+            "start": 109983701,
+            "end": 109996593,
             "audio": false
         },
         {
             "filename": "/resources/textures/2x/Enhancers.png",
             "crunched": 0,
-            "start": 138326079,
-            "end": 138419964,
+            "start": 109996593,
+            "end": 110090478,
             "audio": false
         },
         {
             "filename": "/resources/textures/2x/gamepad_ui.png",
             "crunched": 0,
-            "start": 138419964,
-            "end": 138444829,
+            "start": 110090478,
+            "end": 110115343,
             "audio": false
         },
         {
             "filename": "/resources/textures/2x/icons.png",
             "crunched": 0,
-            "start": 138444829,
-            "end": 138456399,
+            "start": 110115343,
+            "end": 110126913,
             "audio": false
         },
         {
             "filename": "/resources/textures/2x/Jokers.png",
             "crunched": 0,
-            "start": 138456399,
-            "end": 139068923,
+            "start": 110126913,
+            "end": 110739437,
             "audio": false
         },
         {
             "filename": "/resources/textures/2x/localthunk-logo.png",
             "crunched": 0,
-            "start": 139068923,
-            "end": 139089486,
+            "start": 110739437,
+            "end": 110760000,
             "audio": false
         },
         {
             "filename": "/resources/textures/2x/playstack-logo.png",
             "crunched": 0,
-            "start": 139089486,
-            "end": 139196874,
+            "start": 110760000,
+            "end": 110867388,
             "audio": false
         },
         {
             "filename": "/resources/textures/2x/ShopSignAnimation.png",
             "crunched": 0,
-            "start": 139196874,
-            "end": 139212529,
+            "start": 110867388,
+            "end": 110883043,
             "audio": false
         },
         {
             "filename": "/resources/textures/2x/stickers.png",
             "crunched": 0,
-            "start": 139212529,
-            "end": 139219267,
+            "start": 110883043,
+            "end": 110889781,
             "audio": false
         },
         {
             "filename": "/resources/textures/2x/tags.png",
             "crunched": 0,
-            "start": 139219267,
-            "end": 139230118,
+            "start": 110889781,
+            "end": 110900632,
             "audio": false
         },
         {
             "filename": "/resources/textures/2x/Tarots.png",
             "crunched": 0,
-            "start": 139230118,
-            "end": 139349780,
+            "start": 110900632,
+            "end": 111020294,
             "audio": false
         },
         {
             "filename": "/resources/textures/2x/ui_assets_opt2.png",
             "crunched": 0,
-            "start": 139349780,
-            "end": 139351534,
+            "start": 111020294,
+            "end": 111022048,
             "audio": false
         },
         {
             "filename": "/resources/textures/2x/ui_assets.png",
             "crunched": 0,
-            "start": 139351534,
-            "end": 139353291,
+            "start": 111022048,
+            "end": 111023805,
             "audio": false
         },
         {
             "filename": "/resources/textures/2x/Vouchers.png",
             "crunched": 0,
-            "start": 139353291,
-            "end": 139437892,
+            "start": 111023805,
+            "end": 111108406,
             "audio": false
         },
         {
             "filename": "/SMODS/lovely_regex.lua",
             "crunched": 0,
-            "start": 139437892,
-            "end": 139468484,
+            "start": 111108406,
+            "end": 111138998,
             "audio": false
         },
         {
             "filename": "/SMODS/nativefs.lua",
             "crunched": 0,
-            "start": 139468484,
-            "end": 139471706,
+            "start": 111138998,
+            "end": 111142756,
             "audio": false
         },
         {
             "filename": "/SMODS/preflight/loader.lua",
             "crunched": 0,
-            "start": 139471706,
-            "end": 139511314,
+            "start": 111142756,
+            "end": 111182364,
             "audio": false
         },
         {
             "filename": "/SMODS/preflight/logging.lua",
             "crunched": 0,
-            "start": 139511314,
-            "end": 139511960,
+            "start": 111182364,
+            "end": 111183010,
             "audio": false
         },
         {
             "filename": "/SMODS/preflight/sharedUI.lua",
             "crunched": 0,
-            "start": 139511960,
-            "end": 139517886,
+            "start": 111183010,
+            "end": 111188936,
             "audio": false
         },
         {
             "filename": "/SMODS/preflight/sharedUtil.lua",
             "crunched": 0,
-            "start": 139517886,
-            "end": 139521184,
+            "start": 111188936,
+            "end": 111192234,
             "audio": false
         },
         {
             "filename": "/SMODS/release.lua",
             "crunched": 0,
-            "start": 139521184,
-            "end": 139521221,
+            "start": 111192234,
+            "end": 111192271,
             "audio": false
         },
         {
             "filename": "/SMODS/version.lua",
             "crunched": 0,
-            "start": 139521221,
-            "end": 139521258,
+            "start": 111192271,
+            "end": 111192308,
             "audio": false
         },
         {
             "filename": "/SMODS/web_bootstrap.lua",
             "crunched": 0,
-            "start": 139521258,
-            "end": 139560878,
+            "start": 111192308,
+            "end": 111240350,
             "audio": false
         },
         {
             "filename": "/SMODS/web_compare.lua",
             "crunched": 0,
-            "start": 139560878,
-            "end": 139574201,
+            "start": 111240350,
+            "end": 111253955,
             "audio": false
         },
         {
             "filename": "/SMODS/web_shaders.lua",
             "crunched": 0,
-            "start": 139574201,
-            "end": 139579294,
+            "start": 111253955,
+            "end": 111283605,
             "audio": false
         },
         {
             "filename": "/SMODS/web_threads.lua",
             "crunched": 0,
-            "start": 139579294,
-            "end": 139583772,
+            "start": 111283605,
+            "end": 111288083,
             "audio": false
         },
         {
             "filename": "/tag.lua",
             "crunched": 0,
-            "start": 139583772,
-            "end": 139608911,
+            "start": 111288083,
+            "end": 111313222,
             "audio": false
         },
         {
             "filename": "/version.jkr",
             "crunched": 0,
-            "start": 139608911,
-            "end": 139608945,
+            "start": 111313222,
+            "end": 111313256,
             "audio": false
         }
     ]

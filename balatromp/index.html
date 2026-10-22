@@ -30,14 +30,151 @@
       top: 50% !important;
       left: 50% !important;
     }
+
+    /* Troubleshooting widget (bottom-left): reset caches / view the console without devtools */
+    #toolsWidget {
+      position: fixed; left: 6px; bottom: 6px; z-index: 1000;
+      font: 12px sans-serif; color: #fff; opacity: 0.75; transition: opacity 0.2s;
+    }
+    #toolsWidget:hover, #toolsWidget.open { opacity: 1; }
+    #toolsWidget button {
+      position: static !important; width: auto !important; height: auto !important;
+      margin: 2px !important; padding: 4px 8px !important;
+      font: 12px sans-serif !important; color: #fff !important;
+      background: #3a3a3a !important; border: 1px solid #777 !important; border-radius: 4px; cursor: pointer;
+    }
+    #toolsWidget button.danger { background: #7a2a2a !important; }
+    #toolsLogBtn.has-errors { background: #a33 !important; }
+    #toolsMenu { display: none; background: rgba(0,0,0,0.85); border: 1px solid #555; border-radius: 6px; padding: 6px; margin-bottom: 4px; }
+    #toolsWidget.open #toolsMenu { display: block; }
+    #toolsLog {
+      display: none; position: fixed; left: 6px; right: 6px; top: 6px; bottom: 44px; z-index: 999;
+      margin: 0; padding: 8px; overflow: auto; white-space: pre-wrap; word-break: break-all;
+      font: 11px monospace; color: #ddd; background: rgba(0,0,0,0.9); border: 1px solid #555; border-radius: 6px;
+    }
+    #toolsLog .err { color: #ff8080; }
+    #toolsLog .warn { color: #ffd479; }
   </style>
+
+  <script type="text/javascript">
+    // --- TROUBLESHOOTING: on-page console log (devtools are often unavailable, e.g. on managed Chromebooks) ---
+    (function () {
+      var MAX_LINES = 500;
+      var lines = [];
+      var hasErrors = false;
+      window.__toolsLog = lines;
+
+      function fmt(a) {
+        if (a instanceof Error) return a.stack || String(a);
+        if (typeof a === 'object' && a !== null) {
+          try { return JSON.stringify(a); } catch (e) { return String(a); }
+        }
+        return String(a);
+      }
+      function push(level, args) {
+        var text = Array.prototype.map.call(args, fmt).join(' ');
+        lines.push({ level: level, text: '[' + (performance.now() / 1000).toFixed(1) + 's] ' + text });
+        if (lines.length > MAX_LINES) lines.shift();
+        if (level === 'err' && !hasErrors) {
+          hasErrors = true;
+          var btn = document.getElementById('toolsLogBtn');
+          if (btn) btn.classList.add('has-errors');
+        }
+        var view = document.getElementById('toolsLog');
+        if (view && view.style.display === 'block') window.__renderToolsLog();
+      }
+      ['log', 'info', 'warn', 'error'].forEach(function (name) {
+        var orig = console[name].bind(console);
+        var level = name === 'error' ? 'err' : name === 'warn' ? 'warn' : '';
+        console[name] = function () { push(level, arguments); return orig.apply(null, arguments); };
+      });
+      window.addEventListener('error', function (e) {
+        push('err', ['Uncaught: ' + (e.error && e.error.stack || e.message) + ' (' + e.filename + ':' + e.lineno + ')']);
+      });
+      window.addEventListener('unhandledrejection', function (e) {
+        push('err', ['Unhandled rejection: ' + fmt(e.reason)]);
+      });
+      push('', ['User agent: ' + navigator.userAgent + ' | memory: ' + (navigator.deviceMemory || '?') + 'GB']);
+
+      window.__renderToolsLog = function () {
+        var view = document.getElementById('toolsLog');
+        var atBottom = view.scrollTop + view.clientHeight >= view.scrollHeight - 20;
+        view.textContent = '';
+        lines.forEach(function (l) {
+          var div = document.createElement('div');
+          if (l.level) div.className = l.level;
+          div.textContent = l.text;
+          view.appendChild(div);
+        });
+        if (atBottom) view.scrollTop = view.scrollHeight;
+      };
+    })();
+
+    // --- TROUBLESHOOTING: cache reset ---
+    // A reset is flagged in localStorage and performed on the next page load, before the game opens any database,
+    // so open IndexedDB connections can't block the deletion.
+    var RESET_FLAG = 'balatro_pending_reset';
+    var SAVE_DB_NAME = '/home/web_user/love'; // emscripten IDBFS mount (settings + save files)
+
+    function deleteDatabase(name) {
+      return new Promise(function (resolve) {
+        try {
+          var req = indexedDB.deleteDatabase(name);
+          req.onsuccess = req.onerror = function () { resolve(); };
+          req.onblocked = function () { console.warn('[Reset] deleting ' + name + ' is blocked by another open tab'); };
+          setTimeout(resolve, 5000);
+        } catch (e) { resolve(); }
+      });
+    }
+
+    window.__resetDone = (function () {
+      var mode = null;
+      try { mode = localStorage.getItem(RESET_FLAG); localStorage.removeItem(RESET_FLAG); } catch (e) {}
+      if (!mode) return null;
+
+      console.log('[Reset] performing "' + mode + '" reset...');
+      var listDbs = indexedDB.databases ? indexedDB.databases().then(function (dbs) {
+        return dbs.map(function (d) { return d.name; });
+      }).catch(function () { return []; }) : Promise.resolve([]);
+
+      return listDbs.then(function (names) {
+        if (names.indexOf('EM_PRELOAD_CACHE') === -1) names.push('EM_PRELOAD_CACHE');
+        if (mode === 'all' && names.indexOf(SAVE_DB_NAME) === -1) names.push(SAVE_DB_NAME);
+        if (mode !== 'all') names = names.filter(function (n) { return n !== SAVE_DB_NAME; });
+        return Promise.all(names.map(function (n) { console.log('[Reset] deleting IndexedDB "' + n + '"'); return deleteDatabase(n); }));
+      }).then(function () {
+        if (!window.caches) return;
+        return caches.keys().then(function (keys) { return Promise.all(keys.map(function (k) { return caches.delete(k); })); });
+      }).then(function () {
+        if (!navigator.serviceWorker || !navigator.serviceWorker.getRegistrations) return;
+        return navigator.serviceWorker.getRegistrations().then(function (regs) { return Promise.all(regs.map(function (r) { return r.unregister(); })); });
+      }).then(function () {
+        try {
+          if (mode === 'all') localStorage.clear();
+          else localStorage.removeItem('packageUuid');
+        } catch (e) {}
+        console.log('[Reset] done');
+      }).catch(function (e) {
+        console.error('[Reset] failed:', e);
+      });
+    })();
+
+    function requestReset(mode) {
+      var msg = mode === 'all'
+        ? 'Delete EVERYTHING, including your save files, settings and mod selection, then reload?\n\nThis cannot be undone.'
+        : 'Clear the downloaded game data cache and reload? Your saves are kept; the game will be downloaded again.';
+      if (!confirm(msg)) return;
+      try { localStorage.setItem(RESET_FLAG, mode); } catch (e) {}
+      location.reload();
+    }
+  </script>
 </head>
 
 <body>
   <div id="fullscreenDiv">
     
     <!-- Mod Selector UI -->
-    <div id="modSelector" style="display: none; position: absolute; z-index: 100; top: 50%; left: 50%; transform: translate(-50%, -50%); background: rgba(0,0,0,0.85); color: white; padding: 20px; border-radius: 10px; border: 2px solid #555; max-height: 80vh; min-width: 300px; overflow-y: auto; font-family: sans-serif; box-shadow: 0 0 20px rgba(0,0,0,0.8);">
+    <div id="modSelector" style="display: none; position: absolute; z-index: 1001; top: 50%; left: 50%; transform: translate(-50%, -50%); background: rgba(0,0,0,0.85); color: white; padding: 20px; border-radius: 10px; border: 2px solid #555; max-height: 80vh; min-width: 300px; overflow-y: auto; font-family: sans-serif; box-shadow: 0 0 20px rgba(0,0,0,0.8);">
         <h2 style="margin-top: 0; text-align: center; border-bottom: 1px solid #555; padding-bottom: 10px;">Select Mods</h2>
         <div id="modList" style="text-align: left; margin-bottom: 20px; display: flex; flex-direction: column; gap: 8px;"></div>
         <div style="text-align: center;">
@@ -45,7 +182,19 @@
         </div>
     </div>
     
-    <button id="loaderbutton" style="display: none; position: absolute; z-index: 100; top: 50%; left: 50%; transform: translate(-50%, -50%); padding: 10px 20px; font-size: 1.2em; cursor: pointer; background: #3a3a3a; color: white; border: 1px solid #777; border-radius: 5px;">Click to Start</button>
+    <div id="modTooltip" style="display: none; position: fixed; z-index: 1002; max-width: 280px; padding: 8px 10px; font: 0.9em sans-serif; color: #eee; background: rgba(20,20,20,0.97); border: 1px solid #777; border-radius: 6px; box-shadow: 0 2px 10px rgba(0,0,0,0.6); white-space: pre-wrap; pointer-events: none;"></div>
+
+    <button id="loaderbutton" style="display: none; position: absolute; z-index: 1001; top: 50%; left: 50%; transform: translate(-50%, -50%); padding: 10px 20px; font-size: 1.2em; cursor: pointer; background: #3a3a3a; color: white; border: 1px solid #777; border-radius: 5px;">Click to Start</button>
+
+    <pre id="toolsLog"></pre>
+    <div id="toolsWidget">
+      <div id="toolsMenu">
+        <button type="button" onclick="requestReset('cache')">Clear game cache</button><br />
+        <button type="button" class="danger" onclick="requestReset('all')">Reset everything (deletes saves)</button>
+      </div>
+      <button type="button" id="toolsToggleBtn" onclick="document.getElementById('toolsWidget').classList.toggle('open')">&#128465; Clear data</button>
+      <button type="button" id="toolsLogBtn" onclick="var v = document.getElementById('toolsLog'); var show = v.style.display !== 'block'; v.style.display = show ? 'block' : 'none'; if (show) window.__renderToolsLog();">Log</button>
+    </div>
 
     <div id="header1"></div>
     <canvas id="loadingCanvas" oncontextmenu="event.preventDefault()" width="800" height="600" display="none"></canvas>
@@ -120,6 +269,23 @@
           document.getElementById('header1').remove();
         }
       },
+      // Frame cap: the main loop runs on requestAnimationFrame, i.e. at the display's refresh rate, so 120/144Hz
+      // screens ran the whole game 2-2.4x as often as 60Hz ones for no visible benefit. Override with ?fps=N (0 = off).
+      // LÖVE measures dt from the real clock, so skipped frames don't change game speed.
+      preMainLoop: (function () {
+        var param = new URLSearchParams(location.search).get('fps');
+        var fps = param === null ? 60 : parseFloat(param);
+        if (!(fps > 0)) return undefined;
+        var interval = 1000 / fps;
+        var next = 0;
+        return function () {
+          var now = performance.now();
+          if (now < next - interval / 4) return false; // tolerance so frame jitter on a 60Hz display never drops frames
+          // Advance on a fixed schedule (averages exactly `fps`), but don't try to catch up after a stall
+          next += interval;
+          if (next < now) next = now + interval;
+        };
+      })(),
       totalDependencies: 0,
       remainingDependencies: 0,
       monitorRunDependencies: function(left) {
@@ -217,6 +383,29 @@
           // Build UI
           mods.forEach(mod => {
             let label = document.createElement('label');
+            let description = mod.description || 'No description provided.';
+            // Hover bubble beside the mod selector, level with the hovered row
+            let showDescription = () => {
+              let tip = document.getElementById('modTooltip');
+              tip.textContent = '';
+              let name = document.createElement('strong');
+              name.textContent = mod.folder;
+              tip.appendChild(name);
+              tip.appendChild(document.createTextNode('\n' + description));
+              tip.style.display = 'block';
+              let row = label.getBoundingClientRect();
+              let panel = document.getElementById('modSelector').getBoundingClientRect();
+              let left = panel.right + 10;
+              if (left + tip.offsetWidth > window.innerWidth - 8) left = Math.max(8, panel.left - tip.offsetWidth - 10);
+              let top = Math.min(row.top, window.innerHeight - tip.offsetHeight - 8);
+              tip.style.left = left + 'px';
+              tip.style.top = Math.max(8, top) + 'px';
+            };
+            let hideDescription = () => { document.getElementById('modTooltip').style.display = 'none'; };
+            label.addEventListener('mouseenter', showDescription);
+            label.addEventListener('mouseleave', hideDescription);
+            label.addEventListener('focusin', showDescription);
+            label.addEventListener('focusout', hideDescription);
             label.style.display = 'flex';
             label.style.alignItems = 'center';
             label.style.cursor = 'pointer';
@@ -265,17 +454,29 @@
         window.disabledModsString = disabled.join('\n');
         
         document.getElementById('modSelector').style.display = 'none';
+        document.getElementById('modTooltip').style.display = 'none';
         load();
     };
 
     function load() {
+      let loaderBtn = document.getElementById('loaderbutton');
+      if (loaderBtn) loaderBtn.remove();
+      // A pending cache reset must finish before the game opens its databases. Otherwise start synchronously,
+      // inside the click handler, so the user gesture still counts for audio.
+      if (window.__resetDone) window.__resetDone.then(startGame);
+      else startGame();
+    }
+
+    function startGame() {
+      // The troubleshooting buttons only stay on screen in-game if the log was opened before starting
+      if (document.getElementById('toolsLog').style.display !== 'block') {
+        document.getElementById('toolsWidget').style.display = 'none';
+      }
       if (window.disabledModsString !== undefined) {
           Module.arguments.push('--web-blacklist');
           Module.arguments.push(window.disabledModsString);
       }
       applicationLoad(document.getElementById('data'));
-      let loaderBtn = document.getElementById('loaderbutton');
-      if (loaderBtn) loaderBtn.remove();
     }
 
     // --- SAVING HOOKS (FIXED FOR CRYPTID) ---
@@ -363,7 +564,7 @@
     })();
    
     (function () {
-      const WISP_ENDPOINT = "wss://girlspreples.org/wi/";
+      const WISP_ENDPOINT = "ws://localhost:5001/";
       const MULTIPLAYER_PORT = 8788;
       const WS_DEBUG = true;
       const NativeWebSocket = window.WebSocket;
